@@ -47,6 +47,8 @@ const E = {
   OPT_SEC: 30, OPT_ADJUST: 20, OPT_HIGH: 40, OPT_LOW: 10,
   PULSE_CEIL: 200, PULSE_FLOOR: 0,
   OVERRIDE_STUCK_DAYS: 3,
+  WATER_DISCHARGE_LPH: 10, WATER_NUM_DRIPPERS: 100, WATER_FIELD_HA: 10,
+  WATER_MISMATCH_THRESHOLD: 0.2, WATER_NORMAL_VARIANCE: 0.075, WATER_PUMP_FAILURE_PROB: 0.01,
 };
 
 const OPTIMAL_VWC = {
@@ -191,6 +193,8 @@ function makeEngine(cfg) {
     cal1AlertFired: false, cal2NoRiseFired: false, vwcNotRisingFired: false,
     cal2Below10Fired: false, cal3Below10Fired: false, cal3Above40Fired: false,
     t40Active: false, t20Below1Active: false, t20Below1Cooldown: 0,
+    waterUsageHistory: [],
+    waterMismatchFired: false, pumpFailureDay: null, clogDay: null,
     alerts: [],
     logBuffer: [],   // collects one day's worth of decision log lines
   };
@@ -307,6 +311,68 @@ function checkOverrideStuck(eng, day) {
   }
 }
 
+function calculateWaterUsage(eng, day) {
+  const dischargeLph = E.WATER_DISCHARGE_LPH;
+  const numDrippers = E.WATER_NUM_DRIPPERS;
+  const fieldHa = E.WATER_FIELD_HA;
+
+  // Planned: (lph / 60) × pulses × sec / drippers / hectares
+  const plannedLiters = (dischargeLph / 60) * eng.program.pulses * eng.program.sec;
+  const plannedPerHa = plannedLiters / fieldHa;
+
+  // Actual: planned with variance
+  let actualLiters = plannedLiters;
+
+  // If frozen, no water delivered
+  if (eng.frozen) {
+    actualLiters = 0;
+  } else {
+    // Check for pump failure or clog
+    if (eng.pumpFailureDay === null && eng.clogDay === null) {
+      // 1% chance of pump failure or clog starting
+      if (Math.random() < E.WATER_PUMP_FAILURE_PROB) {
+        if (Math.random() < 0.5) {
+          eng.pumpFailureDay = day;
+          pushAlert(eng, "red", "⚠ Pump failure detected — water delivery suspended.", day);
+        } else {
+          eng.clogDay = day;
+          pushAlert(eng, "red", "⚠ System clog detected — water delivery severely reduced.", day);
+        }
+      }
+    }
+
+    if (eng.pumpFailureDay !== null) {
+      // Pump failure: 0 delivery
+      actualLiters = 0;
+    } else if (eng.clogDay !== null) {
+      // Clog: 20% delivery (70% reduction)
+      actualLiters *= 0.3;
+    } else {
+      // Normal variance: ±7.5% (normal distribution)
+      const variance = (Math.random() - 0.5) * 2 * E.WATER_NORMAL_VARIANCE;
+      actualLiters *= (1 + variance);
+    }
+  }
+
+  const actualPerHa = actualLiters / fieldHa;
+
+  // Check mismatch
+  const deviation = Math.abs(actualLiters - plannedLiters) / plannedLiters;
+  const mismatch = deviation > E.WATER_MISMATCH_THRESHOLD;
+
+  if (mismatch && !eng.waterMismatchFired) {
+    const pct = (deviation * 100).toFixed(0);
+    pushAlert(eng, "yellow", `Water usage mismatch: ${pct}% deviation from planned.`, day);
+    eng.waterMismatchFired = true;
+  } else if (!mismatch) {
+    eng.waterMismatchFired = false;
+  }
+
+  eng.waterUsageHistory.push({
+    day, plannedLiters, plannedPerHa, actualLiters, actualPerHa, deviation, mismatch
+  });
+}
+
 // ─── processDay: main algorithm — logs every decision to eng.logBuffer ────────
 function processDay(eng, r, day) {
   eng.logBuffer = [];  // reset for this day
@@ -314,6 +380,7 @@ function processDay(eng, r, day) {
   applyPendingIfNewCycle(eng, day);
   checkUniversalAlerts(eng, r, day);
   checkOverrideStuck(eng, day);
+  calculateWaterUsage(eng, day);
 
   const litres = eng.cfg.dischargeLph > 0
     ? eng.program.pulses * (eng.program.sec / 3600) * eng.cfg.dischargeLph
@@ -1081,6 +1148,51 @@ export default function SensAItionSimulator() {
                 </tbody>
               </table>
             </div>
+          </div>
+        )}
+
+        {/* ── WATER USAGE METER ── */}
+        {eng.waterUsageHistory.length > 0 && (
+          <div style={{ ...card }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center",
+              padding: "12px 16px", borderBottom: `1px solid ${C.border}` }}>
+              <div style={labelStyle}>Water usage: Planned vs Actual</div>
+              {eng.waterUsageHistory.some(w => w.mismatch) && (
+                <span style={{ fontSize: 12, background: `${C.red}22`, color: C.red, padding: "4px 8px", borderRadius: 4, fontWeight: 600 }}>
+                  ⚠ Mismatch detected
+                </span>
+              )}
+            </div>
+            <div style={{ overflowX: "auto", maxHeight: 240, overflowY: "auto" }}>
+              <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 16 }}>
+                <thead>
+                  <tr style={{ background: C.raised, borderBottom: `1px solid ${C.border}` }}>
+                    <th style={{ textAlign: "left", padding: "8px 12px", fontWeight: 600, color: C.sub }}>Day</th>
+                    <th style={{ textAlign: "right", padding: "8px 12px", fontWeight: 600, color: C.sub }}>Planned (L/ha)</th>
+                    <th style={{ textAlign: "right", padding: "8px 12px", fontWeight: 600, color: C.sub }}>Actual (L/ha)</th>
+                    <th style={{ textAlign: "right", padding: "8px 12px", fontWeight: 600, color: C.sub }}>Deviation</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {eng.waterUsageHistory.slice(-7).map((w, i) => (
+                    <tr key={i} style={{ borderBottom: `1px solid ${C.border}`, background: w.mismatch ? `${C.red}0A` : "transparent" }}>
+                      <td style={{ padding: "8px 12px", color: C.chalk, fontWeight: 500 }}>Day {w.day}</td>
+                      <td style={{ textAlign: "right", padding: "8px 12px", color: C.green, fontWeight: 500 }}>{w.plannedPerHa.toFixed(1)}</td>
+                      <td style={{ textAlign: "right", padding: "8px 12px", color: w.mismatch ? C.red : C.chalk, fontWeight: 500 }}>{w.actualPerHa.toFixed(1)}</td>
+                      <td style={{ textAlign: "right", padding: "8px 12px", color: w.mismatch ? C.red : C.dim, fontWeight: 500 }}>
+                        {(w.deviation * 100).toFixed(0)}%
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            {eng.waterUsageHistory.length > 0 && (
+              <div style={{ padding: "10px 16px", background: C.raised, borderTop: `1px solid ${C.border}`, fontSize: 15, color: C.sub, display: "flex", justifyContent: "space-between" }}>
+                <span>Cumulative: <strong style={{ color: C.chalk }}>{eng.waterUsageHistory.reduce((a, w) => a + w.plannedLiters, 0).toFixed(0)} L</strong> planned</span>
+                <span><strong style={{ color: C.chalk }}>{eng.waterUsageHistory.reduce((a, w) => a + w.actualLiters, 0).toFixed(0)} L</strong> actual</span>
+              </div>
+            )}
           </div>
         )}
 
