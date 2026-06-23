@@ -35,7 +35,14 @@ class SensorSimulator:
       net_delta_T20 = tension_rise - tension_drop
     """
 
-    DISCHARGE_LPH        = 1.0
+    # Dripper defaults (agronomist-configurable):
+    #   num_drippers    : 21,600  (adjust in steps of 100)
+    #   dripper_flow_lph: 1.0 L/hr (adjust in steps of 0.25 L/hr)
+    DEFAULT_NUM_DRIPPERS     = 21_600
+    DEFAULT_DRIPPER_FLOW_LPH = 1.0
+    DRIPPER_STEP             = 100
+    DRIPPER_FLOW_STEP        = 0.25
+
     MB_PER_LITRE         = 1.5
     DRYING_RATE          = 4.0
     DEPTH_LAG_FACTOR     = 0.55
@@ -46,12 +53,19 @@ class SensorSimulator:
     READINGS_PER_DAY     = 144
     SAMPLE_INTERVAL_MIN  = 10
 
-    def __init__(self, soil_type: SoilType = SoilType.MEDIUM,
-                 mb_per_litre: float = None,
-                 drying_rate: float = None):
-        self.soil           = SimulatorState(soil_type=soil_type)
-        self.mb_per_litre   = mb_per_litre or self.MB_PER_LITRE
-        self.drying_rate    = drying_rate  or self.DRYING_RATE
+    def __init__(
+        self,
+        soil_type: SoilType = SoilType.MEDIUM,
+        num_drippers: int = DEFAULT_NUM_DRIPPERS,
+        dripper_flow_lph: float = DEFAULT_DRIPPER_FLOW_LPH,
+        mb_per_litre: float = None,
+        drying_rate: float = None,
+    ):
+        self.soil             = SimulatorState(soil_type=soil_type)
+        self.num_drippers     = num_drippers
+        self.dripper_flow_lph = dripper_flow_lph
+        self.mb_per_litre     = mb_per_litre or self.MB_PER_LITRE
+        self.drying_rate      = drying_rate  or self.DRYING_RATE
 
     def simulate_day_readings(
         self,
@@ -72,7 +86,8 @@ class SensorSimulator:
         daily_litres = (
             program.num_pulses
             * (program.pulse_duration_sec / 3600)
-            * self.DISCHARGE_LPH
+            * self.num_drippers
+            * self.dripper_flow_lph
         )
 
         tension_drop = daily_litres * self.mb_per_litre

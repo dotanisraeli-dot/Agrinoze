@@ -18,13 +18,17 @@ def run_simulation(max_days: int = 200):
     config = SiteConfig(
         soil_type=SoilType.MEDIUM,
         water_type=WaterType.REGULAR,
-        discharge_rate_lph=1.0,
-        num_drippers=100,
+        discharge_rate_lph=1.0,       # L/hr per dripper (step 0.25)
+        num_drippers=21_600,          # total drippers   (step 100)
         use_extended_pulse_sub2=False,
     )
 
     engine    = IrrigationEngine(config)
-    simulator = SensorSimulator(soil_type=config.soil_type)
+    simulator = SensorSimulator(
+        soil_type=config.soil_type,
+        num_drippers=config.num_drippers,
+        dripper_flow_lph=config.discharge_rate_lph,
+    )
 
     start_date = datetime(2026, 1, 1)
 
