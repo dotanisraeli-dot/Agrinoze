@@ -77,17 +77,32 @@ function eqVwcFromTension(teq, vwcDry, vwcWet) {
   const frac = Math.max(0, Math.min(1, 1 - teq / 80));
   return vwcDry + (vwcWet - vwcDry) * frac;
 }
-// ET offset in mb/day added to equilibrium tension (simulates evapotranspiration drying)
-const ET_OFFSET = { low: -4, medium: 0, high: 6 };
+// ET model: scales how fast the soil moves toward its dry-direction equilibrium.
+// The equilibrium point (teq) is always set by the irrigation program — ET does NOT shift it.
+// This means all three levels eventually reach the same stable T20 values; they differ only in speed.
+//
+// kDryScale: multiplier on k when teq > curT (soil is drying between irrigations)
+//   low:    0.5 → soil dries at half speed (cooler/humid conditions, less crop demand)
+//   medium: 1.0 → baseline behaviour (original model, unchanged)
+//   high:   1.5 → soil dries 50% faster (hot season, high crop ET demand)
+//
+// Wetting direction (teq < curT, irrigation reducing tension) always uses normal k —
+// the irrigation itself isn't less effective just because of weather.
+const ET_CONFIG = {
+  low:    { kDryScale: 0.5 },
+  medium: { kDryScale: 1.0 },
+  high:   { kDryScale: 1.5 },
+};
 
 function stepSoil(soil, program, dischargeLph, frozen, etLevel = "medium") {
   const litres = frozen ? 0 : program.pulses * (program.sec / 3600) * dischargeLph;
-  const teqBase = eqTension(litres, soil.A, soil.b, soil.tFloor);
-  // ET shifts the equilibrium tension upward (drier) or downward (cooler/humid)
-  const teq = Math.max(soil.tFloor, Math.min(88, teqBase + (ET_OFFSET[etLevel] || 0)));
+  const teq = eqTension(litres, soil.A, soil.b, soil.tFloor);
   const veq = eqVwcFromTension(teq, soil.vwcDry, soil.vwcWet);
   const noise = () => (Math.random() - 0.5) * 1.0;
-  const curT = Math.max(0, soil.curT + (teq - soil.curT) * soil.k + noise());
+  const { kDryScale } = ET_CONFIG[etLevel] || ET_CONFIG.medium;
+  const gap = teq - soil.curT;
+  const effectiveK = gap > 0 ? soil.k * kDryScale : soil.k;
+  const curT = Math.max(0, soil.curT + gap * effectiveK + noise());
   const curVwc = Math.max(0, Math.min(100, soil.curVwc + (veq - soil.curVwc) * soil.k * 0.7));
   return { ...soil, curT, curVwc };
 }
