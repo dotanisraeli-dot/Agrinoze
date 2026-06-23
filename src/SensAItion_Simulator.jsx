@@ -77,9 +77,14 @@ function eqVwcFromTension(teq, vwcDry, vwcWet) {
   const frac = Math.max(0, Math.min(1, 1 - teq / 80));
   return vwcDry + (vwcWet - vwcDry) * frac;
 }
-function stepSoil(soil, program, dischargeLph, frozen) {
+// ET offset in mb/day added to equilibrium tension (simulates evapotranspiration drying)
+const ET_OFFSET = { low: -4, medium: 0, high: 6 };
+
+function stepSoil(soil, program, dischargeLph, frozen, etLevel = "medium") {
   const litres = frozen ? 0 : program.pulses * (program.sec / 3600) * dischargeLph;
-  const teq = eqTension(litres, soil.A, soil.b, soil.tFloor);
+  const teqBase = eqTension(litres, soil.A, soil.b, soil.tFloor);
+  // ET shifts the equilibrium tension upward (drier) or downward (cooler/humid)
+  const teq = Math.max(soil.tFloor, Math.min(88, teqBase + (ET_OFFSET[etLevel] || 0)));
   const veq = eqVwcFromTension(teq, soil.vwcDry, soil.vwcWet);
   const noise = () => (Math.random() - 0.5) * 1.0;
   const curT = Math.max(0, soil.curT + (teq - soil.curT) * soil.k + noise());
@@ -314,7 +319,7 @@ function checkOverrideStuck(eng, day) {
 function calculateWaterUsage(eng, day) {
   const dischargeLph = (eng.cfg.dischargeLph || E.WATER_DISCHARGE_LPH) * (eng.cfg.drippers || E.WATER_NUM_DRIPPERS);
   const numDrippers = eng.cfg.drippers || E.WATER_NUM_DRIPPERS;
-  const fieldHa = E.WATER_FIELD_HA;
+  const fieldHa = eng.cfg.fieldHa || E.WATER_FIELD_HA;
 
   // PLANNED: what the controller commanded
   const plannedLiters = (dischargeLph / 60) * eng.program.pulses * eng.program.sec;
@@ -399,7 +404,10 @@ function processDay(eng, r, day) {
   const litres = eng.cfg.dischargeLph > 0
     ? eng.program.pulses * (eng.program.sec / 3600) * eng.cfg.dischargeLph * (eng.cfg.drippers || E.WATER_NUM_DRIPPERS)
     : 0;
-  const prog = `${eng.program.pulses} pulses × ${eng.program.sec}s  (~${litres.toFixed(2)} L/day)`;
+  const fHa = eng.cfg.fieldHa || E.WATER_FIELD_HA;
+  const lPerHa = fHa > 0 ? litres / fHa : 0;
+  const mmPerDay = lPerHa / 10; // 1 mm/ha = 10 L/ha (10,000 m² × 0.001 m depth = 10 m³ = 10,000 L... actually 1mm over 1ha = 10,000 L, so L/ha / 10 = mm)
+  const prog = `${eng.program.pulses} pulses × ${eng.program.sec}s  (~${litres.toFixed(0)} L/day | ${lPerHa.toFixed(0)} L/ha | ${mmPerDay.toFixed(2)} mm/day)`;
 
   // Header line for this day's log entry
   eng.logBuffer.push(`${"=".repeat(60)}`);
@@ -580,6 +588,8 @@ export default function SensAItionSimulator() {
   const [soilType, setSoilType] = useState("medium");
   const [numDrippers, setNumDrippers] = useState(21600);
   const [dripperFlowLph, setDripperFlowLph] = useState(1.0);
+  const [etLevel, setEtLevel] = useState("medium");
+  const [fieldHa, setFieldHa] = useState(10);
   const [engineState, setEngineState] = useState(null);
   const [soilState, setSoilState] = useState(null);
   const [day, setDay] = useState(0);
@@ -621,7 +631,7 @@ export default function SensAItionSimulator() {
   const reset = useCallback((st) => {
     const cfg = {
       soilType: st, has40cm: st !== "soilless", extPulse: false,
-      cal2MaxDays: 14, dischargeLph: dripperFlowLph, drippers: numDrippers,
+      cal2MaxDays: 14, dischargeLph: dripperFlowLph, drippers: numDrippers, fieldHa,
     };
     const eng = makeEngine(cfg);
     const soil = makeSoil(st);
@@ -630,9 +640,9 @@ export default function SensAItionSimulator() {
     setEngineState({ ...eng }); setSoilState({ ...soil });
     setDay(0); setHistory([]); setDailyAvgHistory([]); setAlerts([]);
     setDecisionLog([]); setRunning(false); setUploadDayIdx(0); setTick(t => t + 1);
-  }, [numDrippers, dripperFlowLph]);
+  }, [numDrippers, dripperFlowLph, fieldHa]);
 
-  useEffect(() => { reset(soilType); }, [soilType, numDrippers, dripperFlowLph, reset]);
+  useEffect(() => { reset(soilType); }, [soilType, numDrippers, dripperFlowLph, fieldHa, reset]);
 
   // file upload handler
   const handleFileUpload = useCallback((e) => {
@@ -666,6 +676,21 @@ export default function SensAItionSimulator() {
     reset(soilType);
   }, [soilType, reset]);
 
+  // CSV export of daily history
+  const exportCSV = useCallback(() => {
+    if (dailyAvgHistory.length === 0) return;
+    const header = "day,date,stage,T20_mb,T40_mb,VWC_pct,pulses,total_L_day,L_per_ha,mm_per_day";
+    const rows = dailyAvgHistory.map(h =>
+      `${h.day},${h.date || ""},${h.stage},${h.t20.toFixed(2)},${h.t40.toFixed(2)},${h.vwc.toFixed(2)},${h.pulses},${(h.litres_day||0).toFixed(0)},${(h.lpha||0).toFixed(0)},${(h.mmday||0).toFixed(3)}`
+    );
+    const csv = [header, ...rows].join("\n");
+    const blob = new Blob([csv], { type: "text/csv" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url; a.download = `sensation_daily_history_day${day}.csv`; a.click();
+    URL.revokeObjectURL(url);
+  }, [dailyAvgHistory, day]);
+
   // simulation step — uses uploaded data or soil simulator
   const stepOnce = useCallback(() => {
     const eng = engRef.current, soil = soilRef.current;
@@ -697,7 +722,7 @@ export default function SensAItionSimulator() {
       // Total field water (for usage reporting) = dripper_flow × num_drippers.
       const perDripperLph = eng.cfg.dischargeLph || E.WATER_DISCHARGE_LPH;
       const totalDischargeLph = perDripperLph * (eng.cfg.drippers || E.WATER_NUM_DRIPPERS);
-      const newSoil = stepSoil(soil, eff, perDripperLph, eng.frozen);
+      const newSoil = stepSoil(soil, eff, perDripperLph, eng.frozen, etLevel);
       soilRef.current = newSoil;
       setSoilState({ ...newSoil });
       const base = soilReadings(newSoil);
@@ -719,13 +744,17 @@ export default function SensAItionSimulator() {
       t20: dayAvg.t20, t40: dayAvg.t40, vwc: dayAvg.vwc,
       pulses: eng.program.pulses, stage: eng.stage,
     }].slice(-120));
+    const _fHa = eng.cfg.fieldHa || E.WATER_FIELD_HA;
+    const _litresDay = eng.program.pulses * (eng.program.sec / 3600) * (eng.cfg.dischargeLph || E.WATER_DISCHARGE_LPH) * (eng.cfg.drippers || E.WATER_NUM_DRIPPERS);
+    const _lpha = _fHa > 0 ? _litresDay / _fHa : 0;
+    const _mmday = _lpha / 10;
     setDailyAvgHistory(h => [...h, {
       day: d, t20: dayAvg.t20, t40: dayAvg.t40, vwc: dayAvg.vwc,
       n: dayAvg.n ?? READINGS_PER_DAY, stage: eng.stage, pulses: eng.program.pulses,
-      date: dayAvg.date,
+      date: dayAvg.date, litres_day: _litresDay, lpha: _lpha, mmday: _mmday,
     }].slice(-180));
     setTick(t => t + 1);
-  }, []);
+  }, [etLevel]);
 
   useEffect(() => {
     if (!running) return;
@@ -812,6 +841,47 @@ export default function SensAItionSimulator() {
             <input type="file" accept=".csv,.txt" onChange={handleFileUpload}
               style={{ display: "none" }} />
           </label>
+
+          {/* CSV Export */}
+          {dailyAvgHistory.length > 0 && (
+            <button onClick={exportCSV} style={{
+              background: `${C.green}22`, border: `1px solid ${C.green}55`,
+              borderRadius: 6, padding: "5px 10px", fontSize: 16.5,
+              color: C.green, fontWeight: 600, cursor: "pointer" }}>
+              ⬇ CSV
+            </button>
+          )}
+
+          {/* ET level */}
+          <div style={{ display: "flex", alignItems: "center", gap: 6,
+            background: C.raised, border: `1px solid ${C.border}`,
+            borderRadius: 6, padding: "4px 10px", fontSize: 16.5 }}>
+            <span style={{ color: C.sub, fontWeight: 600 }}>☀ ET</span>
+            {["low", "medium", "high"].map(lv => (
+              <button key={lv} onClick={() => setEtLevel(lv)} style={{
+                background: etLevel === lv ? `${C.amber}33` : "none",
+                border: `1px solid ${etLevel === lv ? C.amber : C.border}`,
+                borderRadius: 4, color: etLevel === lv ? C.amber : C.sub,
+                cursor: "pointer", padding: "1px 8px", fontSize: 15, fontWeight: etLevel === lv ? 700 : 400 }}>
+                {lv}
+              </button>
+            ))}
+          </div>
+
+          {/* Field area */}
+          <div style={{ display: "flex", alignItems: "center", gap: 6,
+            background: C.raised, border: `1px solid ${C.border}`,
+            borderRadius: 6, padding: "4px 10px", fontSize: 16.5 }}>
+            <span style={{ color: C.sub, fontWeight: 600 }}>🌾 ha</span>
+            <button onClick={() => setFieldHa(n => Math.max(0.5, parseFloat((n - 0.5).toFixed(1))))}
+              style={{ background: "none", border: `1px solid ${C.border}`, borderRadius: 4,
+                color: C.chalk, cursor: "pointer", padding: "1px 7px", fontSize: 16 }}>−</button>
+            <span style={{ color: C.chalk, fontWeight: 700, minWidth: 36, textAlign: "center",
+              fontVariantNumeric: "tabular-nums" }}>{fieldHa}</span>
+            <button onClick={() => setFieldHa(n => parseFloat((n + 0.5).toFixed(1)))}
+              style={{ background: "none", border: `1px solid ${C.border}`, borderRadius: 4,
+                color: C.chalk, cursor: "pointer", padding: "1px 7px", fontSize: 16 }}>+</button>
+          </div>
 
           {/* Dripper controls */}
           <div style={{ display: "flex", alignItems: "center", gap: 6,
