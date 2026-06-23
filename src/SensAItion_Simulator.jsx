@@ -692,8 +692,12 @@ export default function SensAItionSimulator() {
         return;
       }
       const eff = effectiveProgram(eng);
-      const totalDischargeLph = (eng.cfg.dischargeLph || E.WATER_DISCHARGE_LPH) * (eng.cfg.drippers || E.WATER_NUM_DRIPPERS);
-      const newSoil = stepSoil(soil, eff, totalDischargeLph, eng.frozen);
+      // Soil physics uses per-dripper flow only — the local tensiometer near one dripper
+      // is unaffected by how many drippers are in the field.
+      // Total field water (for usage reporting) = dripper_flow × num_drippers.
+      const perDripperLph = eng.cfg.dischargeLph || E.WATER_DISCHARGE_LPH;
+      const totalDischargeLph = perDripperLph * (eng.cfg.drippers || E.WATER_NUM_DRIPPERS);
+      const newSoil = stepSoil(soil, eff, perDripperLph, eng.frozen);
       soilRef.current = newSoil;
       setSoilState({ ...newSoil });
       const base = soilReadings(newSoil);
