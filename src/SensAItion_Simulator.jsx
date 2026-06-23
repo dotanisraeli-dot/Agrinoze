@@ -47,7 +47,7 @@ const E = {
   OPT_SEC: 30, OPT_ADJUST: 20, OPT_HIGH: 40, OPT_LOW: 10,
   PULSE_CEIL: 200, PULSE_FLOOR: 0,
   OVERRIDE_STUCK_DAYS: 3,
-  WATER_DISCHARGE_LPH: 10, WATER_NUM_DRIPPERS: 100, WATER_FIELD_HA: 10,
+  WATER_DISCHARGE_LPH: 1.0, WATER_NUM_DRIPPERS: 21600, WATER_FIELD_HA: 10,
   WATER_MISMATCH_THRESHOLD: 0.2, WATER_NORMAL_VARIANCE: 0.075, WATER_PUMP_FAILURE_PROB: 0.01,
 };
 
@@ -312,8 +312,8 @@ function checkOverrideStuck(eng, day) {
 }
 
 function calculateWaterUsage(eng, day) {
-  const dischargeLph = (eng.cfg.dischargeLph || E.WATER_DISCHARGE_LPH) * E.WATER_NUM_DRIPPERS;
-  const numDrippers = E.WATER_NUM_DRIPPERS;
+  const dischargeLph = (eng.cfg.dischargeLph || E.WATER_DISCHARGE_LPH) * (eng.cfg.drippers || E.WATER_NUM_DRIPPERS);
+  const numDrippers = eng.cfg.drippers || E.WATER_NUM_DRIPPERS;
   const fieldHa = E.WATER_FIELD_HA;
 
   // PLANNED: what the controller commanded
@@ -397,7 +397,7 @@ function processDay(eng, r, day) {
   calculateWaterUsage(eng, day);
 
   const litres = eng.cfg.dischargeLph > 0
-    ? eng.program.pulses * (eng.program.sec / 3600) * eng.cfg.dischargeLph
+    ? eng.program.pulses * (eng.program.sec / 3600) * eng.cfg.dischargeLph * (eng.cfg.drippers || E.WATER_NUM_DRIPPERS)
     : 0;
   const prog = `${eng.program.pulses} pulses × ${eng.program.sec}s  (~${litres.toFixed(2)} L/day)`;
 
@@ -578,6 +578,8 @@ function fmtProgram(p) {
 // ─── Main Component ────────────────────────────────────────────────────────
 export default function SensAItionSimulator() {
   const [soilType, setSoilType] = useState("medium");
+  const [numDrippers, setNumDrippers] = useState(21600);
+  const [dripperFlowLph, setDripperFlowLph] = useState(1.0);
   const [engineState, setEngineState] = useState(null);
   const [soilState, setSoilState] = useState(null);
   const [day, setDay] = useState(0);
@@ -619,7 +621,7 @@ export default function SensAItionSimulator() {
   const reset = useCallback((st) => {
     const cfg = {
       soilType: st, has40cm: st !== "soilless", extPulse: false,
-      cal2MaxDays: 14, dischargeLph: 1.0, drippers: 100,
+      cal2MaxDays: 14, dischargeLph: dripperFlowLph, drippers: numDrippers,
     };
     const eng = makeEngine(cfg);
     const soil = makeSoil(st);
@@ -628,9 +630,9 @@ export default function SensAItionSimulator() {
     setEngineState({ ...eng }); setSoilState({ ...soil });
     setDay(0); setHistory([]); setDailyAvgHistory([]); setAlerts([]);
     setDecisionLog([]); setRunning(false); setUploadDayIdx(0); setTick(t => t + 1);
-  }, []);
+  }, [numDrippers, dripperFlowLph]);
 
-  useEffect(() => { reset(soilType); }, [soilType, reset]);
+  useEffect(() => { reset(soilType); }, [soilType, numDrippers, dripperFlowLph, reset]);
 
   // file upload handler
   const handleFileUpload = useCallback((e) => {
@@ -690,7 +692,7 @@ export default function SensAItionSimulator() {
         return;
       }
       const eff = effectiveProgram(eng);
-      const totalDischargeLph = (eng.cfg.dischargeLph || E.WATER_DISCHARGE_LPH) * E.WATER_NUM_DRIPPERS;
+      const totalDischargeLph = (eng.cfg.dischargeLph || E.WATER_DISCHARGE_LPH) * (eng.cfg.drippers || E.WATER_NUM_DRIPPERS);
       const newSoil = stepSoil(soil, eff, totalDischargeLph, eng.frozen);
       soilRef.current = newSoil;
       setSoilState({ ...newSoil });
@@ -806,6 +808,34 @@ export default function SensAItionSimulator() {
             <input type="file" accept=".csv,.txt" onChange={handleFileUpload}
               style={{ display: "none" }} />
           </label>
+
+          {/* Dripper controls */}
+          <div style={{ display: "flex", alignItems: "center", gap: 6,
+            background: C.raised, border: `1px solid ${C.border}`,
+            borderRadius: 6, padding: "4px 10px", fontSize: 16.5 }}>
+            <span style={{ color: C.sub, fontWeight: 600 }}>💧 Drippers</span>
+            <button onClick={() => setNumDrippers(n => Math.max(100, n - 100))}
+              style={{ background: "none", border: `1px solid ${C.border}`, borderRadius: 4,
+                color: C.chalk, cursor: "pointer", padding: "1px 7px", fontSize: 16 }}>−</button>
+            <span style={{ color: C.chalk, fontWeight: 700, minWidth: 52, textAlign: "center",
+              fontVariantNumeric: "tabular-nums" }}>{numDrippers.toLocaleString()}</span>
+            <button onClick={() => setNumDrippers(n => n + 100)}
+              style={{ background: "none", border: `1px solid ${C.border}`, borderRadius: 4,
+                color: C.chalk, cursor: "pointer", padding: "1px 7px", fontSize: 16 }}>+</button>
+          </div>
+          <div style={{ display: "flex", alignItems: "center", gap: 6,
+            background: C.raised, border: `1px solid ${C.border}`,
+            borderRadius: 6, padding: "4px 10px", fontSize: 16.5 }}>
+            <span style={{ color: C.sub, fontWeight: 600 }}>⚡ Flow</span>
+            <button onClick={() => setDripperFlowLph(f => Math.max(0.25, parseFloat((f - 0.25).toFixed(2))))}
+              style={{ background: "none", border: `1px solid ${C.border}`, borderRadius: 4,
+                color: C.chalk, cursor: "pointer", padding: "1px 7px", fontSize: 16 }}>−</button>
+            <span style={{ color: C.chalk, fontWeight: 700, minWidth: 40, textAlign: "center",
+              fontVariantNumeric: "tabular-nums" }}>{dripperFlowLph.toFixed(2)} L/h</span>
+            <button onClick={() => setDripperFlowLph(f => parseFloat((f + 0.25).toFixed(2)))}
+              style={{ background: "none", border: `1px solid ${C.border}`, borderRadius: 4,
+                color: C.chalk, cursor: "pointer", padding: "1px 7px", fontSize: 16 }}>+</button>
+          </div>
 
           <select value={soilType} onChange={e => setSoilType(e.target.value)}
             style={{ background: C.raised, color: C.chalk, border: `1px solid ${C.border}`,
