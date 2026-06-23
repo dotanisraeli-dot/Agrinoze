@@ -783,7 +783,7 @@ export default function SensAItionSimulator() {
             style={{ height: 108, borderRadius: 6, background: "#fff", padding: "3px 6px", objectFit: "contain" }} />
           <div>
             
-            <div style={{ fontSize: 30, color: C.dim, marginTop: 1 }}>Agronomist Simulator <span style={{ fontSize: 24, color: C.sub, marginLeft: 6 }}>v2.1</span></div>
+            <div style={{ fontSize: 30, color: C.dim, marginTop: 1 }}>Agronomist Simulator <span style={{ fontSize: 24, color: C.sub, marginLeft: 6 }}>v2.3</span></div>
           </div>
         </div>
         {/* Right: controls */}
