@@ -339,7 +339,8 @@ function calculateWaterUsage(eng, day) {
   const fieldHa = eng.cfg.fieldHa || E.WATER_FIELD_HA;
 
   // PLANNED: what the controller commanded
-  const plannedLiters = (dischargeLph / 60) * eng.program.pulses * eng.program.sec;
+  // dischargeLph [L/h] × pulses × (sec/3600) [h per pulse] = total litres
+  const plannedLiters = dischargeLph * eng.program.pulses * (eng.program.sec / 3600);
   const plannedPerHa = plannedLiters / fieldHa;
 
   // ACTUAL: independently simulated based on system health & random factors
@@ -423,7 +424,7 @@ function processDay(eng, r, day) {
     : 0;
   const fHa = eng.cfg.fieldHa || E.WATER_FIELD_HA;
   const lPerHa = fHa > 0 ? litres / fHa : 0;
-  const mmPerDay = lPerHa / 10; // 1 mm/ha = 10 L/ha (10,000 m² × 0.001 m depth = 10 m³ = 10,000 L... actually 1mm over 1ha = 10,000 L, so L/ha / 10 = mm)
+  const mmPerDay = lPerHa / 10000; // 1 mm over 1 ha = 10,000 L → mm = L/ha ÷ 10,000
   const prog = `${eng.program.pulses} pulses × ${eng.program.sec}s  (~${litres.toFixed(0)} L/day | ${lPerHa.toFixed(0)} L/ha | ${mmPerDay.toFixed(2)} mm/day)`;
 
   // Header line for this day's log entry
@@ -764,7 +765,7 @@ export default function SensAItionSimulator() {
     const _fHa = eng.cfg.fieldHa || E.WATER_FIELD_HA;
     const _litresDay = eng.program.pulses * (eng.program.sec / 3600) * (eng.cfg.dischargeLph || E.WATER_DISCHARGE_LPH) * (eng.cfg.drippers || E.WATER_NUM_DRIPPERS);
     const _lpha = _fHa > 0 ? _litresDay / _fHa : 0;
-    const _mmday = _lpha / 10;
+    const _mmday = _lpha / 10000;
     setDailyAvgHistory(h => [...h, {
       day: d, t20: dayAvg.t20, t40: dayAvg.t40, vwc: dayAvg.vwc,
       n: dayAvg.n ?? READINGS_PER_DAY, stage: eng.stage, pulses: eng.program.pulses,
@@ -820,122 +821,143 @@ export default function SensAItionSimulator() {
     <div style={{ background: C.bg, minHeight: "100vh", color: C.chalk,
       fontFamily: "'Inter','SF Pro Display',system-ui,sans-serif", padding: 0 }}>
 
-      {/* ── TOP BAR ── */}
+      {/* ── TOP BAR ROW 1: identity + status + data I/O ── */}
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between",
-        padding: "10px 20px", borderBottom: `1px solid ${C.border}` }}>
-        {/* Left: SensAItion logo + title */}
+        padding: "10px 20px 8px", borderBottom: `1px solid ${C.border}` }}>
+
+        {/* Left: logo + title */}
         <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
           <img src={LOGO_B64} alt="SensAItion"
             style={{ height: 108, borderRadius: 6, background: "#fff", padding: "3px 6px", objectFit: "contain" }} />
           <div>
-            
-            <div style={{ fontSize: 30, color: C.dim, marginTop: 1 }}>Agronomist Simulator <span style={{ fontSize: 24, color: C.sub, marginLeft: 6 }}>v2.3</span></div>
+            <div style={{ fontSize: 30, color: C.dim, marginTop: 1 }}>
+              Agronomist Simulator <span style={{ fontSize: 24, color: C.sub, marginLeft: 6 }}>v2.3</span>
+            </div>
           </div>
         </div>
-        {/* Right: controls */}
-        <div style={{ display: "flex", alignItems: "center", gap: 12, fontSize: 18, color: C.sub }}>
-          <span>Day <strong style={{ color: C.chalk, fontVariantNumeric: "tabular-nums" }}>{day}</strong></span>
 
-          {/* File mode badge */}
+        {/* Right: day counter · file badge · I/O buttons */}
+        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          <span style={{ fontSize: 18, color: C.sub }}>
+            Day <strong style={{ color: C.chalk, fontVariantNumeric: "tabular-nums" }}>{day}</strong>
+          </span>
+
           {isFileMode && (
             <div style={{ display: "flex", alignItems: "center", gap: 6,
               background: `${C.blue}22`, border: `1px solid ${C.blue}55`,
-              borderRadius: 6, padding: "4px 10px", fontSize: 16.5 }}>
+              borderRadius: 6, padding: "4px 10px", fontSize: 16 }}>
               <span style={{ color: C.blue }}>📂</span>
               <span style={{ color: C.blue, fontWeight: 600 }}>{uploadFileName}</span>
               <span style={{ color: C.dim }}>({uploadDayIdx}/{uploadedData.length} days)</span>
               <button onClick={clearUpload} style={{ background: "none", border: "none",
-                color: C.dim, cursor: "pointer", fontSize: 18, padding: 0, marginLeft: 2 }}>✕</button>
+                color: C.dim, cursor: "pointer", fontSize: 17, padding: 0, marginLeft: 2 }}>✕</button>
             </div>
           )}
 
-          {/* File upload button */}
           <label style={{ display: "flex", alignItems: "center", gap: 5,
             background: C.raised, border: `1px solid ${C.border}`,
-            borderRadius: 6, padding: "5px 10px", fontSize: 16.5, cursor: "pointer",
+            borderRadius: 6, padding: "5px 12px", fontSize: 16, cursor: "pointer",
             color: C.sub, fontWeight: 600 }}>
-            <span>📥 Load data file</span>
-            <input type="file" accept=".csv,.txt" onChange={handleFileUpload}
-              style={{ display: "none" }} />
+            📥 Load data file
+            <input type="file" accept=".csv,.txt" onChange={handleFileUpload} style={{ display: "none" }} />
           </label>
 
-          {/* CSV Export */}
           {dailyAvgHistory.length > 0 && (
             <button onClick={exportCSV} style={{
               background: `${C.green}22`, border: `1px solid ${C.green}55`,
-              borderRadius: 6, padding: "5px 10px", fontSize: 16.5,
+              borderRadius: 6, padding: "5px 12px", fontSize: 16,
               color: C.green, fontWeight: 600, cursor: "pointer" }}>
-              ⬇ CSV
+              ⬇ Export CSV
             </button>
           )}
+        </div>
+      </div>
 
-          {/* ET level */}
-          <div style={{ display: "flex", alignItems: "center", gap: 6,
-            background: C.raised, border: `1px solid ${C.border}`,
-            borderRadius: 6, padding: "4px 10px", fontSize: 16.5 }}>
-            <span style={{ color: C.sub, fontWeight: 600 }}>☀ ET</span>
-            {["low", "medium", "high"].map(lv => (
-              <button key={lv} onClick={() => setEtLevel(lv)} style={{
-                background: etLevel === lv ? `${C.amber}33` : "none",
-                border: `1px solid ${etLevel === lv ? C.amber : C.border}`,
-                borderRadius: 4, color: etLevel === lv ? C.amber : C.sub,
-                cursor: "pointer", padding: "1px 8px", fontSize: 15, fontWeight: etLevel === lv ? 700 : 400 }}>
-                {lv}
-              </button>
-            ))}
-          </div>
+      {/* ── TOP BAR ROW 2: field configuration ── */}
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between",
+        padding: "8px 20px", borderBottom: `1px solid ${C.border}`,
+        background: C.raised, gap: 16 }}>
 
-          {/* Field area */}
-          <div style={{ display: "flex", alignItems: "center", gap: 6,
-            background: C.raised, border: `1px solid ${C.border}`,
-            borderRadius: 6, padding: "4px 10px", fontSize: 16.5 }}>
-            <span style={{ color: C.sub, fontWeight: 600 }}>🌾 ha</span>
-            <button onClick={() => setFieldHa(n => Math.max(0.5, parseFloat((n - 0.5).toFixed(1))))}
-              style={{ background: "none", border: `1px solid ${C.border}`, borderRadius: 4,
-                color: C.chalk, cursor: "pointer", padding: "1px 7px", fontSize: 16 }}>−</button>
-            <span style={{ color: C.chalk, fontWeight: 700, minWidth: 36, textAlign: "center",
-              fontVariantNumeric: "tabular-nums" }}>{fieldHa}</span>
-            <button onClick={() => setFieldHa(n => parseFloat((n + 0.5).toFixed(1)))}
-              style={{ background: "none", border: `1px solid ${C.border}`, borderRadius: 4,
-                color: C.chalk, cursor: "pointer", padding: "1px 7px", fontSize: 16 }}>+</button>
-          </div>
-
-          {/* Dripper controls */}
-          <div style={{ display: "flex", alignItems: "center", gap: 6,
-            background: C.raised, border: `1px solid ${C.border}`,
-            borderRadius: 6, padding: "4px 10px", fontSize: 16.5 }}>
-            <span style={{ color: C.sub, fontWeight: 600 }}>💧 Drippers</span>
-            <button onClick={() => setNumDrippers(n => Math.max(100, n - 100))}
-              style={{ background: "none", border: `1px solid ${C.border}`, borderRadius: 4,
-                color: C.chalk, cursor: "pointer", padding: "1px 7px", fontSize: 16 }}>−</button>
-            <span style={{ color: C.chalk, fontWeight: 700, minWidth: 52, textAlign: "center",
-              fontVariantNumeric: "tabular-nums" }}>{numDrippers.toLocaleString()}</span>
-            <button onClick={() => setNumDrippers(n => n + 100)}
-              style={{ background: "none", border: `1px solid ${C.border}`, borderRadius: 4,
-                color: C.chalk, cursor: "pointer", padding: "1px 7px", fontSize: 16 }}>+</button>
-          </div>
-          <div style={{ display: "flex", alignItems: "center", gap: 6,
-            background: C.raised, border: `1px solid ${C.border}`,
-            borderRadius: 6, padding: "4px 10px", fontSize: 16.5 }}>
-            <span style={{ color: C.sub, fontWeight: 600 }}>⚡ Flow</span>
-            <button onClick={() => setDripperFlowLph(f => Math.max(0.25, parseFloat((f - 0.25).toFixed(2))))}
-              style={{ background: "none", border: `1px solid ${C.border}`, borderRadius: 4,
-                color: C.chalk, cursor: "pointer", padding: "1px 7px", fontSize: 16 }}>−</button>
-            <span style={{ color: C.chalk, fontWeight: 700, minWidth: 40, textAlign: "center",
-              fontVariantNumeric: "tabular-nums" }}>{dripperFlowLph.toFixed(2)} L/h</span>
-            <button onClick={() => setDripperFlowLph(f => parseFloat((f + 0.25).toFixed(2)))}
-              style={{ background: "none", border: `1px solid ${C.border}`, borderRadius: 4,
-                color: C.chalk, cursor: "pointer", padding: "1px 7px", fontSize: 16 }}>+</button>
-          </div>
+        {/* Group: Field */}
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <span style={{ fontSize: 13, fontWeight: 700, letterSpacing: "0.1em",
+            textTransform: "uppercase", color: C.dim, marginRight: 2 }}>Field</span>
 
           <select value={soilType} onChange={e => setSoilType(e.target.value)}
-            style={{ background: C.raised, color: C.chalk, border: `1px solid ${C.border}`,
-              borderRadius: 6, padding: "5px 8px", fontSize: 18 }}>
+            style={{ background: C.surface, color: C.chalk, border: `1px solid ${C.border}`,
+              borderRadius: 6, padding: "4px 8px", fontSize: 16 }}>
             <option value="medium">Medium soil</option>
             <option value="heavy">Heavy soil</option>
             <option value="sandy">Sandy soil</option>
             <option value="soilless">Soilless</option>
           </select>
+
+          {/* Field area */}
+          <div style={{ display: "flex", alignItems: "center", gap: 5,
+            background: C.surface, border: `1px solid ${C.border}`, borderRadius: 6, padding: "3px 8px" }}>
+            <span style={{ fontSize: 15, color: C.sub, fontWeight: 600 }}>🌾</span>
+            <button onClick={() => setFieldHa(n => Math.max(0.5, parseFloat((n - 0.5).toFixed(1))))}
+              style={{ background: "none", border: `1px solid ${C.border}`, borderRadius: 4,
+                color: C.chalk, cursor: "pointer", padding: "1px 6px", fontSize: 15 }}>−</button>
+            <span style={{ color: C.chalk, fontWeight: 700, minWidth: 42, textAlign: "center",
+              fontSize: 15, fontVariantNumeric: "tabular-nums" }}>{fieldHa} ha</span>
+            <button onClick={() => setFieldHa(n => parseFloat((n + 0.5).toFixed(1)))}
+              style={{ background: "none", border: `1px solid ${C.border}`, borderRadius: 4,
+                color: C.chalk, cursor: "pointer", padding: "1px 6px", fontSize: 15 }}>+</button>
+          </div>
+
+          {/* ET level */}
+          <div style={{ display: "flex", alignItems: "center", gap: 5,
+            background: C.surface, border: `1px solid ${C.border}`, borderRadius: 6, padding: "3px 8px" }}>
+            <span style={{ fontSize: 15, color: C.sub, fontWeight: 600 }}>☀ ET</span>
+            {["low", "medium", "high"].map(lv => (
+              <button key={lv} onClick={() => setEtLevel(lv)} style={{
+                background: etLevel === lv ? `${C.amber}33` : "none",
+                border: `1px solid ${etLevel === lv ? C.amber : C.border}`,
+                borderRadius: 4, color: etLevel === lv ? C.amber : C.sub,
+                cursor: "pointer", padding: "1px 8px", fontSize: 14,
+                fontWeight: etLevel === lv ? 700 : 400 }}>
+                {lv}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {/* Divider */}
+        <div style={{ width: 1, height: 28, background: C.border }} />
+
+        {/* Group: Irrigation hardware */}
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <span style={{ fontSize: 13, fontWeight: 700, letterSpacing: "0.1em",
+            textTransform: "uppercase", color: C.dim, marginRight: 2 }}>Irrigation</span>
+
+          {/* Drippers */}
+          <div style={{ display: "flex", alignItems: "center", gap: 5,
+            background: C.surface, border: `1px solid ${C.border}`, borderRadius: 6, padding: "3px 8px" }}>
+            <span style={{ fontSize: 15, color: C.sub, fontWeight: 600 }}>💧 Drippers</span>
+            <button onClick={() => setNumDrippers(n => Math.max(100, n - 100))}
+              style={{ background: "none", border: `1px solid ${C.border}`, borderRadius: 4,
+                color: C.chalk, cursor: "pointer", padding: "1px 6px", fontSize: 15 }}>−</button>
+            <span style={{ color: C.chalk, fontWeight: 700, minWidth: 52, textAlign: "center",
+              fontSize: 15, fontVariantNumeric: "tabular-nums" }}>{numDrippers.toLocaleString()}</span>
+            <button onClick={() => setNumDrippers(n => n + 100)}
+              style={{ background: "none", border: `1px solid ${C.border}`, borderRadius: 4,
+                color: C.chalk, cursor: "pointer", padding: "1px 6px", fontSize: 15 }}>+</button>
+          </div>
+
+          {/* Flow rate */}
+          <div style={{ display: "flex", alignItems: "center", gap: 5,
+            background: C.surface, border: `1px solid ${C.border}`, borderRadius: 6, padding: "3px 8px" }}>
+            <span style={{ fontSize: 15, color: C.sub, fontWeight: 600 }}>⚡ Flow</span>
+            <button onClick={() => setDripperFlowLph(f => Math.max(0.25, parseFloat((f - 0.25).toFixed(2))))}
+              style={{ background: "none", border: `1px solid ${C.border}`, borderRadius: 4,
+                color: C.chalk, cursor: "pointer", padding: "1px 6px", fontSize: 15 }}>−</button>
+            <span style={{ color: C.chalk, fontWeight: 700, minWidth: 48, textAlign: "center",
+              fontSize: 15, fontVariantNumeric: "tabular-nums" }}>{dripperFlowLph.toFixed(2)} L/h</span>
+            <button onClick={() => setDripperFlowLph(f => parseFloat((f + 0.25).toFixed(2)))}
+              style={{ background: "none", border: `1px solid ${C.border}`, borderRadius: 4,
+                color: C.chalk, cursor: "pointer", padding: "1px 6px", fontSize: 15 }}>+</button>
+          </div>
         </div>
       </div>
 
