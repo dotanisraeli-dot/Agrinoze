@@ -183,8 +183,10 @@ function parseSensorFile(text) {
       const cols = row.split(sep).map(s => s.trim());
       const [dateStr, v1, v2, v3] = cols;
       if (!dateStr) continue;
-      const t20 = parseFloat(v1), t40 = parseFloat(v2), vwc = parseFloat(v3);
-      if (isNaN(t20) || isNaN(t40) || isNaN(vwc)) continue;
+      const t20 = parseFloat(v1), t40 = parseFloat(v2);
+      if (isNaN(t20) || isNaN(t40)) continue;
+      // VWC optional — use 0 as sentinel if missing; display will show N/A
+      const vwc = (v3 !== undefined && v3 !== "" && !isNaN(parseFloat(v3))) ? parseFloat(v3) : 0;
       result.push({ date: dateStr, t20, t40, vwc });
     }
     return result.sort((a, b) => a.date.localeCompare(b.date));
