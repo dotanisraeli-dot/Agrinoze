@@ -623,7 +623,7 @@ function fmtProgram(p) {
 // ─── Main Component ────────────────────────────────────────────────────────
 export default function SensAItionSimulator() {
   const [soilType, setSoilType] = useState("medium");
-  const [numDrippers, setNumDrippers] = useState(21600);
+  const [numDrippers, setNumDrippers] = useState(10000);
   const [dripperFlowLph, setDripperFlowLph] = useState(1.0);
   const [etLevel, setEtLevel] = useState("medium");
   const [engineState, setEngineState] = useState(null);
@@ -1358,6 +1358,7 @@ export default function SensAItionSimulator() {
                         {(latest.plannedLiters / 1000).toFixed(1)}
                       </div>
                       <div style={{ fontSize: 11, color: C.dim, marginTop: 4 }}>m³/day</div>
+                      <div style={{ fontSize: 13, color: C.sub, marginTop: 6, fontVariantNumeric: 'tabular-nums' }}>{(latest.plannedLiters / E.WATER_FIELD_HA).toFixed(0)} L/ha</div>
                     </div>
 
                     {/* Actual */}
@@ -1367,6 +1368,7 @@ export default function SensAItionSimulator() {
                         {(latest.actualLiters / 1000).toFixed(1)}
                       </div>
                       <div style={{ fontSize: 11, color: C.dim, marginTop: 4 }}>m³/day</div>
+                      <div style={{ fontSize: 13, color: C.sub, marginTop: 6, fontVariantNumeric: 'tabular-nums' }}>{(latest.actualLiters / E.WATER_FIELD_HA).toFixed(0)} L/ha</div>
                     </div>
 
                     {/* Deviation */}

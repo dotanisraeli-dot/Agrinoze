@@ -302,7 +302,7 @@ function checkOverrideStuck(eng, day) {
 
 function calculateWaterUsage(eng, day) {
   const dischargeLph = eng.cfg.dischargeLph || E.WATER_DISCHARGE_LPH;
-  const numDrippers = E.WATER_NUM_DRIPPERS;
+  const numDrippers = eng.cfg.drippers || E.WATER_NUM_DRIPPERS;
   const fieldHa = E.WATER_FIELD_HA;
 
   // Planned: (lph / 3600) × pulses × sec × drippers → liters per day for whole field
@@ -553,6 +553,7 @@ function fmtProgram(p) {
 // ─── Main Component ────────────────────────────────────────────────────────
 export default function SensAItionSimulator() {
   const [soilType, setSoilType] = useState("medium");
+  const [numDrippers, setNumDrippers] = useState(10000);
   const [engineState, setEngineState] = useState(null);
   const [soilState, setSoilState] = useState(null);
   const [day, setDay] = useState(0);
@@ -594,7 +595,7 @@ export default function SensAItionSimulator() {
   const reset = useCallback((st) => {
     const cfg = {
       soilType: st, has40cm: st !== "soilless", extPulse: false,
-      cal2MaxDays: 14, dischargeLph: 1.0, drippers: 100,
+      cal2MaxDays: 14, dischargeLph: 1.0, drippers: numDrippers,
     };
     const eng = makeEngine(cfg);
     const soil = makeSoil(st);
@@ -603,9 +604,9 @@ export default function SensAItionSimulator() {
     setEngineState({ ...eng }); setSoilState({ ...soil });
     setDay(0); setHistory([]); setDailyAvgHistory([]); setAlerts([]);
     setDecisionLog([]); setRunning(false); setUploadDayIdx(0); setTick(t => t + 1);
-  }, []);
+  }, [numDrippers]);
 
-  useEffect(() => { reset(soilType); }, [soilType, reset]);
+  useEffect(() => { reset(soilType); }, [soilType, numDrippers, reset]);
 
   // file upload handler
   const handleFileUpload = useCallback((e) => {
@@ -788,6 +789,18 @@ export default function SensAItionSimulator() {
             <option value="sandy">Sandy soil</option>
             <option value="soilless">Soilless</option>
           </select>
+
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <span style={{ fontSize: 17, color: C.sub }}>Drippers:</span>
+            <button onClick={() => setNumDrippers(d => Math.max(100, d - 100))}
+              style={{ background: C.raised, color: C.chalk, border: `1px solid ${C.border}`,
+                borderRadius: 6, padding: "3px 10px", fontSize: 18, cursor: "pointer" }}>−</button>
+            <span style={{ fontSize: 19, fontWeight: 700, minWidth: 54, textAlign: "center",
+              color: C.chalk, fontVariantNumeric: "tabular-nums" }}>{numDrippers.toLocaleString()}</span>
+            <button onClick={() => setNumDrippers(d => d + 100)}
+              style={{ background: C.raised, color: C.chalk, border: `1px solid ${C.border}`,
+                borderRadius: 6, padding: "3px 10px", fontSize: 18, cursor: "pointer" }}>+</button>
+          </div>
         </div>
       </div>
 
@@ -1155,7 +1168,7 @@ export default function SensAItionSimulator() {
             {/* System configuration info */}
             <div style={{ padding: "10px 16px", background: C.raised, borderBottom: `1px solid ${C.border}`, fontSize: 13, color: C.sub, display: "flex", gap: 20, flexWrap: "wrap" }}>
               <div><strong>Dripper rate:</strong> {eng.cfg.dischargeLph || E.WATER_DISCHARGE_LPH} L/h</div>
-              <div><strong>Drippers:</strong> {E.WATER_NUM_DRIPPERS}</div>
+              <div><strong>Drippers:</strong> {eng.cfg.drippers || E.WATER_NUM_DRIPPERS}</div>
               <div><strong>Field area:</strong> {E.WATER_FIELD_HA} ha</div>
               <div><strong>Threshold:</strong> ±{(E.WATER_MISMATCH_THRESHOLD * 100).toFixed(0)}% deviation</div>
             </div>
@@ -1181,6 +1194,7 @@ export default function SensAItionSimulator() {
                         {latest.plannedPerHa.toFixed(0)}
                       </div>
                       <div style={{ fontSize: 11, color: C.dim, marginTop: 4 }}>L/ha</div>
+                      <div style={{ fontSize: 13, color: C.sub, marginTop: 6, fontVariantNumeric: "tabular-nums" }}>{(latest.plannedLiters / 1000).toFixed(1)} m³/day</div>
                     </div>
 
                     {/* Actual */}
@@ -1190,6 +1204,7 @@ export default function SensAItionSimulator() {
                         {latest.actualPerHa.toFixed(0)}
                       </div>
                       <div style={{ fontSize: 11, color: C.dim, marginTop: 4 }}>L/ha</div>
+                      <div style={{ fontSize: 13, color: C.sub, marginTop: 6, fontVariantNumeric: "tabular-nums" }}>{(latest.actualLiters / 1000).toFixed(1)} m³/day</div>
                     </div>
 
                     {/* Deviation */}
@@ -1221,8 +1236,8 @@ export default function SensAItionSimulator() {
             })()}
             {eng.waterUsageHistory.length > 0 && (
               <div style={{ padding: "10px 16px", background: C.raised, borderTop: `1px solid ${C.border}`, fontSize: 15, color: C.sub, display: "flex", justifyContent: "space-between" }}>
-                <span>Cumulative: <strong style={{ color: C.chalk }}>{eng.waterUsageHistory.reduce((a, w) => a + w.plannedLiters, 0).toFixed(0)} L</strong> planned</span>
-                <span><strong style={{ color: C.chalk }}>{eng.waterUsageHistory.reduce((a, w) => a + w.actualLiters, 0).toFixed(0)} L</strong> actual</span>
+                <span>Cumulative: <strong style={{ color: C.chalk }}>{eng.waterUsageHistory.reduce((a, w) => a + w.plannedLiters, 0).toFixed(0)} L</strong> · <strong style={{ color: C.chalk }}>{(eng.waterUsageHistory.reduce((a, w) => a + w.plannedLiters, 0) / 1000).toFixed(1)} m³</strong> planned</span>
+                <span><strong style={{ color: C.chalk }}>{eng.waterUsageHistory.reduce((a, w) => a + w.actualLiters, 0).toFixed(0)} L</strong> · <strong style={{ color: C.chalk }}>{(eng.waterUsageHistory.reduce((a, w) => a + w.actualLiters, 0) / 1000).toFixed(1)} m³</strong> actual</span>
               </div>
             )}
           </div>
