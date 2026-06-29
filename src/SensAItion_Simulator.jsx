@@ -8,8 +8,8 @@ import {
    SensAItion Agronomist Simulator
    A self-contained demonstration: the irrigation engine + a soil physics model
    running live, fully driveable by the agronomist. Mirrors the Python engine
-   (PRD 19.6.26): stage machine, cycle-boundary changes, two-mode manual
-   override with snapshot + dual exit, irrigation freeze, bounded pulses [0,200].
+   (PRD 29.6.26): stage machine, cycle-boundary changes, full-manual-only
+   override with snapshot + resume-last-auto exit, irrigation freeze, bounded pulses [0,200].
 
    v2: added CSV/TXT sensor data upload (real or synthetic), algorithm decision
    logger with text-file export, SensAItion logo.
@@ -205,9 +205,9 @@ function makeEngine(cfg) {
     windowStart: 0, vwcAtWindowStart: null,
     overrideMode: "none",
     runMode: "auto",
-    snapshot: null, baseline: null,
+    snapshot: null,
     overrideEnteredDay: null, overrideStuckFired: false,
-    pendingProgram: null, pendingStage: null, pendingOverrideMode: null, pendingBaseline: null,
+    pendingProgram: null, pendingStage: null, pendingOverrideMode: null,
     lastCycleDay: null,
     frozen: false,
     cal1NoDropCounter: 0,
@@ -254,45 +254,36 @@ function applyPendingIfNewCycle(eng, day) {
   eng.lastCycleDay = day;
   if (eng.pendingOverrideMode !== null) {
     eng.overrideMode = eng.pendingOverrideMode;
-    eng.runMode = { none: "auto", full_manual: "full_manual", semi_auto: "semi_auto" }[eng.pendingOverrideMode];
+    eng.runMode = { none: "auto", full_manual: "full_manual" }[eng.pendingOverrideMode] ?? "auto";
     eng.pendingOverrideMode = null;
   }
-  if (eng.pendingBaseline !== null) { eng.baseline = eng.pendingBaseline; eng.pendingBaseline = null; }
   if (eng.pendingProgram !== null) { eng.program = eng.pendingProgram; eng.pendingProgram = null; }
   if (eng.pendingStage !== null) { eng.stage = eng.pendingStage; eng.pendingStage = null; }
 }
 
-function enterOverride(eng, mode, pulses, sec, day) {
+function enterOverride(eng, pulses, sec, day) {
   pulses = clamp(pulses);
   eng.snapshot = {
     stage: eng.stage, pulses: eng.program.pulses, sec: eng.program.sec,
     stageEnteredDay: eng.stageEnteredDay, windowStart: eng.windowStart,
     vwcAtWindowStart: eng.vwcAtWindowStart, daysBelow10: eng.daysBelow10, daysAbove40: eng.daysAbove40,
   };
-  const manual = { pulses, sec };
-  eng.pendingProgram = manual;
-  eng.pendingOverrideMode = mode;
-  eng.pendingBaseline = manual;
+  eng.pendingProgram = { pulses, sec };
+  eng.pendingOverrideMode = "full_manual";
   eng.overrideEnteredDay = day;
   eng.overrideStuckFired = false;
 }
 
-function exitOverride(eng, exitMode, day) {
+function exitOverride(eng, day) {
   if (exitMode === "resume_last_auto") {
     const s = eng.snapshot; if (!s) return;
     eng.pendingProgram = { pulses: s.pulses, sec: s.sec };
     eng.pendingStage = s.stage;
     eng.pendingOverrideMode = "none";
-    eng.pendingBaseline = null;
     eng.stageEnteredDay = s.stageEnteredDay;
     eng.windowStart = s.windowStart;
     eng.vwcAtWindowStart = s.vwcAtWindowStart;
     eng.daysBelow10 = s.daysBelow10; eng.daysAbove40 = s.daysAbove40;
-  } else {
-    const b = eng.baseline; if (!b) return;
-    eng.pendingProgram = { pulses: b.pulses, sec: b.sec };
-    eng.pendingOverrideMode = "none";
-    eng.pendingBaseline = null;
   }
   eng.snapshot = null;
   eng.overrideEnteredDay = null;
@@ -301,7 +292,7 @@ function exitOverride(eng, exitMode, day) {
 function freeze(eng) { eng.frozen = true; eng.runMode = "frozen"; }
 function unfreeze(eng) {
   eng.frozen = false;
-  eng.runMode = { none: "auto", full_manual: "full_manual", semi_auto: "semi_auto" }[eng.overrideMode];
+  eng.runMode = eng.overrideMode === "full_manual" ? "full_manual" : "auto";
 }
 
 function checkUniversalAlerts(eng, r, day) {
@@ -328,7 +319,7 @@ function checkUniversalAlerts(eng, r, day) {
 function checkOverrideStuck(eng, day) {
   if (eng.overrideMode === "none" || eng.overrideEnteredDay === null) return;
   if (day - eng.overrideEnteredDay >= E.OVERRIDE_STUCK_DAYS && !eng.overrideStuckFired) {
-    pushAlert(eng, "yellow", `System in ${eng.overrideMode} manual override for ${day - eng.overrideEnteredDay} days without reverting.`, day);
+    pushAlert(eng, "yellow", `System in Full Manual override for ${day - eng.overrideEnteredDay} days — consider reverting to Auto via "Resume last auto".`, day);
     eng.overrideStuckFired = true;
   }
 }
@@ -663,8 +654,7 @@ export default function SensAItionSimulator() {
   const [showFreeze, setShowFreeze] = useState(false);
   const [showOverride, setShowOverride] = useState(false);
   const [showExit, setShowExit] = useState(false);
-  const [ovMode, setOvMode] = useState("semi_auto");
-  const [ovPulses, setOvPulses] = useState(150);
+    const [ovPulses, setOvPulses] = useState(150);
   const [ovSec, setOvSec] = useState(30);
 
   const engRef = useRef(null);
@@ -813,7 +803,6 @@ export default function SensAItionSimulator() {
 
   const modeBanner = {
     auto:        { color: C.green,  bg: `${C.green}1A`,  label: "Automatic",   icon: "⟳", note: "Engine in full control" },
-    semi_auto:   { color: C.amber,  bg: `${C.amber}1A`,  label: "Semi-Auto Override", icon: "◐", note: "Auto logic running from your manual baseline" },
     full_manual: { color: C.purple, bg: `${C.purple}1A`, label: "Full Manual",  icon: "✋", note: "Auto logic PAUSED — manual control only" },
     frozen:      { color: C.frost,  bg: `${C.frost}1A`,  label: "Irrigation Frozen", icon: "❄", note: "Tap closed — logic & timers still running" },
   }[eng.runMode];
@@ -1431,7 +1420,7 @@ export default function SensAItionSimulator() {
 
         <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 }}>
           <div style={{ ...card, padding: "14px 16px" }}>
-            <div style={labelStyle}>Override snapshot &amp; baseline</div>
+            <div style={labelStyle}>Override snapshot</div>
             {eng.overrideMode === "none" && !eng.snapshot ? (
               <div style={{ fontSize: 19.5, color: C.dim, marginTop: 10 }}>No override active.</div>
             ) : (
@@ -1442,12 +1431,7 @@ export default function SensAItionSimulator() {
                     <span style={{ fontWeight: 600 }}>{eng.snapshot.pulses} pulses · {eng.snapshot.sec}s · {eng.snapshot.stage}</span>
                   </div>
                 )}
-                {eng.baseline && (
-                  <div style={{ display: "flex", justifyContent: "space-between" }}>
-                    <span style={{ color: C.sub }}>Manual baseline</span>
-                    <span style={{ fontWeight: 600, color: C.purple }}>{eng.baseline.pulses} pulses · {eng.baseline.sec}s</span>
-                  </div>
-                )}
+
                 <div style={{ display: "flex", justifyContent: "space-between" }}>
                   <span style={{ color: C.sub }}>Mode</span>
                   <span style={{ fontWeight: 600, color: modeBanner.color }}>{modeBanner.label}</span>
@@ -1526,19 +1510,12 @@ export default function SensAItionSimulator() {
             System saves a snapshot first, then stages your values. Takes effect at the next midnight cycle.
           </p>
           <div style={{ ...labelStyle, marginBottom: 8 }}>Override mode</div>
-          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginBottom: 18 }}>
-            {[
-              ["semi_auto", "Semi-Auto", "Auto logic continues from your manual baseline as the fixed anchor."],
-              ["full_manual", "Full Manual", "Auto logic fully paused. Manual continuous program only."],
-            ].map(([k, title, desc]) => (
-              <button key={k} onClick={() => setOvMode(k)} style={{
-                textAlign: "left", padding: "12px 14px", borderRadius: 8, cursor: "pointer",
-                background: ovMode === k ? `${C.purple}1A` : C.raised,
-                border: `1.5px solid ${ovMode === k ? C.purple : C.border}` }}>
-                <div style={{ fontWeight: 700, fontSize: 19.5, color: ovMode === k ? C.purple : C.chalk }}>{title}</div>
-                <div style={{ fontSize: 17.2, color: C.sub, marginTop: 4, lineHeight: 1.45 }}>{desc}</div>
-              </button>
-            ))}
+          <div style={{ padding: "12px 14px", borderRadius: 8, background: `${C.purple}1A`,
+            border: `1.5px solid ${C.purple}`, marginBottom: 18 }}>
+            <div style={{ fontWeight: 700, fontSize: 19.5, color: C.purple }}>✋ Full Manual</div>
+            <div style={{ fontSize: 17.2, color: C.sub, marginTop: 4, lineHeight: 1.45 }}>
+              Auto logic fully paused. Irrigation runs your manual values continuously until you choose "Resume last auto".
+            </div>
           </div>
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16, marginBottom: 8 }}>
             <div>
@@ -1564,7 +1541,7 @@ export default function SensAItionSimulator() {
           <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
             <button onClick={() => setShowOverride(false)} style={btnGhost}>Cancel</button>
             <button onClick={() => {
-              enterOverride(engRef.current, ovMode, ovPulses, ovSec, dayRef.current);
+              enterOverride(engRef.current, ovPulses, ovSec, dayRef.current);
               setEngineState({ ...engRef.current }); setShowOverride(false);
             }} style={btn(C.purple, "#fff")}>Execute (saves snapshot)</button>
           </div>
@@ -1577,20 +1554,19 @@ export default function SensAItionSimulator() {
           <p style={{ fontSize: 18, color: C.sub, margin: "0 0 16px" }}>
             Choose how to hand control back. Takes effect at the next midnight cycle.
           </p>
-          <div style={{ display: "flex", flexDirection: "column", gap: 10, marginBottom: 18 }}>
-            {[
-              ["resume_last_auto", "Resume last auto", `Restore the pre-override snapshot${eng.snapshot ? ` (${eng.snapshot.pulses} pulses · ${eng.snapshot.sec}s · ${eng.snapshot.stage})` : ""} and continue.`],
-              ["resume_modified_auto", "Resume modified-auto", `Keep your manual values${eng.baseline ? ` (${eng.baseline.pulses} pulses · ${eng.baseline.sec}s)` : ""} as the new auto baseline.`],
-            ].map(([k, title, desc]) => (
-              <button key={k} onClick={() => {
-                exitOverride(engRef.current, k, dayRef.current);
-                setEngineState({ ...engRef.current }); setShowExit(false);
-              }} style={{ textAlign: "left", padding: "14px 16px", borderRadius: 8, cursor: "pointer",
-                background: C.raised, border: `1px solid ${C.border}` }}>
-                <div style={{ fontWeight: 700, fontSize: 20.2, color: C.purple }}>{title}</div>
-                <div style={{ fontSize: 18, color: C.sub, marginTop: 4, lineHeight: 1.5 }}>{desc}</div>
-              </button>
-            ))}
+          <div style={{ marginBottom: 18 }}>
+            <button onClick={() => {
+              exitOverride(engRef.current, dayRef.current);
+              setEngineState({ ...engRef.current }); setShowExit(false);
+            }} style={{ textAlign: "left", padding: "14px 16px", borderRadius: 8, cursor: "pointer",
+              background: C.raised, border: `1px solid ${C.border}`, width: "100%" }}>
+              <div style={{ fontWeight: 700, fontSize: 20.2, color: C.purple }}>↩ Resume last auto</div>
+              <div style={{ fontSize: 18, color: C.sub, marginTop: 4, lineHeight: 1.5 }}>
+                {eng.snapshot
+                  ? `Restore snapshot: ${eng.snapshot.pulses} pulses · ${eng.snapshot.sec}s · ${eng.snapshot.stage}. Takes effect at next midnight cycle.`
+                  : "Restore the pre-override auto state and continue from there."}
+              </div>
+            </button>
           </div>
           <div style={{ display: "flex", justifyContent: "flex-end" }}>
             <button onClick={() => setShowExit(false)} style={btnGhost}>Cancel</button>
