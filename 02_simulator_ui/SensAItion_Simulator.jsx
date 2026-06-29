@@ -305,8 +305,8 @@ function calculateWaterUsage(eng, day) {
   const numDrippers = E.WATER_NUM_DRIPPERS;
   const fieldHa = E.WATER_FIELD_HA;
 
-  // Planned: (lph / 60) × pulses × sec → liters per day
-  const plannedLiters = (dischargeLph / 60) * eng.program.pulses * eng.program.sec;
+  // Planned: (lph / 3600) × pulses × sec × drippers → liters per day for whole field
+  const plannedLiters = (dischargeLph / 3600) * eng.program.pulses * eng.program.sec * numDrippers;
   const plannedPerHa = plannedLiters / fieldHa;
 
   // Actual: planned with variance

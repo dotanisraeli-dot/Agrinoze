@@ -329,7 +329,8 @@ function calculateWaterUsage(eng, day) {
   const numDrippers = eng.cfg.drippers || E.WATER_NUM_DRIPPERS;
   // PLANNED: what the controller commanded
   // dischargeLph [L/h] × pulses × (sec/3600) [h per pulse] = total litres
-  const plannedLiters = dischargeLph * eng.program.pulses * (eng.program.sec / 3600);
+  // Planned: (lph / 3600) × pulses × sec × drippers → liters per day for whole field
+  const plannedLiters = (dischargeLph / 3600) * eng.program.pulses * eng.program.sec * numDrippers;
 
   // ACTUAL: independently simulated based on system health & random factors
   let actualLiters = 0;
