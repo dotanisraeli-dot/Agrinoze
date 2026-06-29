@@ -11,8 +11,8 @@ import {
    (PRD 29.6.26): stage machine, cycle-boundary changes, full-manual-only
    override with snapshot + resume-last-auto exit, irrigation freeze, bounded pulses [0,200].
 
-   v2: added CSV/TXT sensor data upload (real or synthetic), algorithm decision
-   logger with text-file export, SensAItion logo.
+   v2: CSV/TXT sensor upload, algorithm decision logger, SensAItion logo.
+   v3: PRD 29.6.26 — single full-manual override mode, Resume last auto only.
    ============================================================================ */
 
 // ─── SensAItion logo (base64 embedded from PRD 19.6.26) ──────────────────────
@@ -843,7 +843,7 @@ export default function SensAItionSimulator() {
             style={{ height: 108, borderRadius: 6, background: "#fff", padding: "3px 6px", objectFit: "contain" }} />
           <div>
             <div style={{ fontSize: 30, color: C.dim, marginTop: 1 }}>
-              Agronomist Simulator <span style={{ fontSize: 24, color: C.sub, marginLeft: 6 }}>v2.3</span>
+              Agronomist Simulator <span style={{ fontSize: 24, color: C.sub, marginLeft: 6 }}>v3.0</span>
             </div>
           </div>
         </div>
