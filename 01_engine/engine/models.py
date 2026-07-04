@@ -40,23 +40,23 @@ class AlertLevel(Enum):
 
 
 class OverrideMode(Enum):
-    """Manual override modes (PRD 18.6.26)."""
+    """Manual override modes (PRD 29.6.26).
+    Full-manual-only in the current phase; Semi-Auto is deferred to
+    Future Requirements per PRD 29.6.26 and is intentionally not modelled here.
+    """
     NONE        = "none"         # system running fully automatic
     FULL_MANUAL = "full_manual"  # auto logic paused; simple continuous program
-    SEMI_AUTO   = "semi_auto"    # auto logic continues from the manual baseline
 
 
 class ExitMode(Enum):
-    """How to leave a manual override (PRD 18.6.26)."""
-    RESUME_LAST_AUTO     = "resume_last_auto"     # restore pre-override snapshot
-    RESUME_MODIFIED_AUTO = "resume_modified_auto" # keep manual values as baseline
+    """How to leave a manual override (PRD 29.6.26). Single exit path."""
+    RESUME_LAST_AUTO = "resume_last_auto"  # restore pre-override snapshot
 
 
 class RunMode(Enum):
     """Top-level run state, surfaced prominently in the UI."""
     AUTO        = "auto"
     FULL_MANUAL = "full_manual"
-    SEMI_AUTO   = "semi_auto"
     FROZEN      = "frozen"      # irrigation freeze: tap closed, logic continues
 
 
@@ -120,6 +120,9 @@ class SensorReading:
     def is_tensiometer_40cm_valid(self) -> bool:
         return 0 <= self.tensiometer_40cm <= 200
 
+    def is_vwc_valid(self) -> bool:
+        return 0 <= self.vwc <= 100
+
 
 # ---------------------------------------------------------------------------
 # Daily sensor average (PRD 19.6.26)
@@ -135,6 +138,12 @@ class DailySensorAverage:
     t40_avg: float               # mean T40 millibar across 144 readings
     vwc_avg: float               # mean VWC % across 144 readings
     num_readings: int = 144      # actual count (may be <144 on first/partial day)
+    # Sensor-fault tracking: readings outside the physically plausible range
+    # (tensiometers 0-200mb, VWC 0-100%) are excluded from the average above.
+    # Non-zero here means the engine should raise a sensor-fault alert.
+    t20_anomalies: int = 0
+    t40_anomalies: int = 0
+    vwc_anomalies: int = 0
     # Optional averages for display-only sensors
     ec_bulk_avg: Optional[float] = None
     ec_pore_avg: Optional[float] = None
@@ -253,11 +262,10 @@ class SystemState:
     # Awaiting manual agronomist start confirmation
     awaiting_manual_start: bool = True
 
-    # ---- Manual override (PRD 18.6.26) ----
+    # ---- Manual override (PRD 29.6.26: full-manual-only in current phase) ----
     override_mode: "OverrideMode" = None          # set in __post_init__
     run_mode: "RunMode" = None                    # set in __post_init__
     override_snapshot: Optional["ProgramSnapshot"] = None  # pre-override auto values
-    override_baseline: Optional[IrrigationProgram] = None  # fixed manual params
     override_entered_at: Optional[datetime] = None         # for 3-day stuck alert
     alert_override_stuck_fired: bool = False
 
@@ -266,7 +274,6 @@ class SystemState:
     pending_program: Optional[IrrigationProgram] = None
     pending_stage: Optional[Stage] = None
     pending_override_mode: Optional["OverrideMode"] = None
-    pending_baseline: Optional[IrrigationProgram] = None
     last_cycle_date: Optional[object] = None      # date of last applied cycle
 
     # ---- Irrigation freeze (PRD 18.6.26) ----
@@ -292,6 +299,19 @@ class SystemState:
     alert_t40_below_10_acknowledged: bool = False
     alert_cal1_no_drop_day_counter: int = 0
 
+    # ---- Sensor-fault / implausible-reading alerts (onset-based, like the
+    # universal sensor alerts above -- fire once, re-arm after a clean day) ----
+    alert_t20_fault_active: bool = False
+    alert_t40_fault_active: bool = False
+    alert_vwc_fault_active: bool = False
+
+    # ---- Discharge mismatch (planned vs actual water usage) ----
+    # Populated by IrrigationEngine.check_discharge(); independent of the
+    # daily decision cycle since PRD checks this every 2 hours.
+    last_planned_liters: Optional[float] = None
+    last_actual_liters: Optional[float] = None
+    last_discharge_pct_diff: Optional[float] = None
+
     def __post_init__(self):
         if self.override_mode is None:
             self.override_mode = OverrideMode.NONE
@@ -303,19 +323,60 @@ class SystemState:
 # Helper: compute a DailySensorAverage from a list of raw SensorReadings
 # ---------------------------------------------------------------------------
 
-def compute_daily_average(readings: List[SensorReading], day_date: date) -> DailySensorAverage:
+def compute_daily_average(
+    readings: List[SensorReading],
+    day_date: date,
+    fallback: Optional["DailySensorAverage"] = None,
+) -> DailySensorAverage:
     """
     PRD 19.6.26: simple mean of all readings for the given day.
     Expected: 144 readings (one every 10 min). Works with any non-zero count.
     Each sensor (T20, T40, VWC) is averaged independently.
+
+    Sensor-fault / implausible-reading handling (controller requirement --
+    "read health of the sensors: faulty/working/implausible readings").
+    Tensiometer readings outside 0-200mb, and VWC readings outside 0-100%,
+    are physically implausible (malfunction suspected per PRD: "values above
+    [200mb] are suspect as a malfunction"). Such readings are excluded from
+    the average so a single glitchy sample can't skew the day's decision.
+    If a sensor has ZERO valid readings for the entire day, the previous
+    day's average is carried forward via `fallback` instead of feeding the
+    algorithm garbage data. Anomaly counts are returned on the
+    DailySensorAverage so the engine can raise a sensor-fault alert.
     """
     if not readings:
         raise ValueError("Cannot compute daily average from empty reading list")
 
     n = len(readings)
-    t20 = sum(r.tensiometer_20cm for r in readings) / n
-    t40 = sum(r.tensiometer_40cm for r in readings) / n
-    vwc = sum(r.vwc for r in readings) / n
+
+    t20_valid = [r.tensiometer_20cm for r in readings if r.is_tensiometer_20cm_valid()]
+    t40_valid = [r.tensiometer_40cm for r in readings if r.is_tensiometer_40cm_valid()]
+    vwc_valid = [r.vwc for r in readings if r.is_vwc_valid()]
+
+    t20_anomalies = n - len(t20_valid)
+    t40_anomalies = n - len(t40_valid)
+    vwc_anomalies = n - len(vwc_valid)
+
+    if t20_valid:
+        t20 = sum(t20_valid) / len(t20_valid)
+    elif fallback is not None:
+        t20 = fallback.t20_avg
+    else:
+        t20 = sum(r.tensiometer_20cm for r in readings) / n
+
+    if t40_valid:
+        t40 = sum(t40_valid) / len(t40_valid)
+    elif fallback is not None:
+        t40 = fallback.t40_avg
+    else:
+        t40 = sum(r.tensiometer_40cm for r in readings) / n
+
+    if vwc_valid:
+        vwc = sum(vwc_valid) / len(vwc_valid)
+    elif fallback is not None:
+        vwc = fallback.vwc_avg
+    else:
+        vwc = sum(r.vwc for r in readings) / n
 
     ec_bulk_vals = [r.ec_bulk for r in readings if r.ec_bulk is not None]
     ec_pore_vals = [r.ec_pore for r in readings if r.ec_pore is not None]
@@ -328,6 +389,9 @@ def compute_daily_average(readings: List[SensorReading], day_date: date) -> Dail
         t40_avg=round(t40, 2),
         vwc_avg=round(vwc, 2),
         num_readings=n,
+        t20_anomalies=t20_anomalies,
+        t40_anomalies=t40_anomalies,
+        vwc_anomalies=vwc_anomalies,
         ec_bulk_avg=round(sum(ec_bulk_vals) / len(ec_bulk_vals), 3) if ec_bulk_vals else None,
         ec_pore_avg=round(sum(ec_pore_vals) / len(ec_pore_vals), 3) if ec_pore_vals else None,
         soil_temp_avg=round(sum(soil_temp_vals) / len(soil_temp_vals), 1) if soil_temp_vals else None,

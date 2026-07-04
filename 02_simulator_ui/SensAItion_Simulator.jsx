@@ -47,7 +47,7 @@ const E = {
   OPT_SEC: 30, OPT_ADJUST: 20, OPT_HIGH: 40, OPT_LOW: 10,
   PULSE_CEIL: 200, PULSE_FLOOR: 0,
   OVERRIDE_STUCK_DAYS: 3,
-  WATER_DISCHARGE_LPH: 10, WATER_NUM_DRIPPERS: 100, WATER_FIELD_HA: 10,
+  WATER_DISCHARGE_LPH: 1.0, WATER_NUM_DRIPPERS: 21600, WATER_FIELD_HA: 10,
   WATER_MISMATCH_THRESHOLD: 0.2, WATER_NORMAL_VARIANCE: 0.075, WATER_PUMP_FAILURE_PROB: 0.01,
 };
 
@@ -77,12 +77,32 @@ function eqVwcFromTension(teq, vwcDry, vwcWet) {
   const frac = Math.max(0, Math.min(1, 1 - teq / 80));
   return vwcDry + (vwcWet - vwcDry) * frac;
 }
-function stepSoil(soil, program, dischargeLph, frozen) {
+// ET model: scales how fast the soil moves toward its dry-direction equilibrium.
+// The equilibrium point (teq) is always set by the irrigation program — ET does NOT shift it.
+// This means all three levels eventually reach the same stable T20 values; they differ only in speed.
+//
+// kDryScale: multiplier on k when teq > curT (soil is drying between irrigations)
+//   low:    0.5 → soil dries at half speed (cooler/humid conditions, less crop demand)
+//   medium: 1.0 → baseline behaviour (original model, unchanged)
+//   high:   1.5 → soil dries 50% faster (hot season, high crop ET demand)
+//
+// Wetting direction (teq < curT, irrigation reducing tension) always uses normal k —
+// the irrigation itself isn't less effective just because of weather.
+const ET_CONFIG = {
+  low:    { kDryScale: 0.5 },
+  medium: { kDryScale: 1.0 },
+  high:   { kDryScale: 1.5 },
+};
+
+function stepSoil(soil, program, dischargeLph, frozen, etLevel = "medium") {
   const litres = frozen ? 0 : program.pulses * (program.sec / 3600) * dischargeLph;
   const teq = eqTension(litres, soil.A, soil.b, soil.tFloor);
   const veq = eqVwcFromTension(teq, soil.vwcDry, soil.vwcWet);
   const noise = () => (Math.random() - 0.5) * 1.0;
-  const curT = Math.max(0, soil.curT + (teq - soil.curT) * soil.k + noise());
+  const { kDryScale } = ET_CONFIG[etLevel] || ET_CONFIG.medium;
+  const gap = teq - soil.curT;
+  const effectiveK = gap > 0 ? soil.k * kDryScale : soil.k;
+  const curT = Math.max(0, soil.curT + gap * effectiveK + noise());
   const curVwc = Math.max(0, Math.min(100, soil.curVwc + (veq - soil.curVwc) * soil.k * 0.7));
   return { ...soil, curT, curVwc };
 }
@@ -163,8 +183,10 @@ function parseSensorFile(text) {
       const cols = row.split(sep).map(s => s.trim());
       const [dateStr, v1, v2, v3] = cols;
       if (!dateStr) continue;
-      const t20 = parseFloat(v1), t40 = parseFloat(v2), vwc = parseFloat(v3);
-      if (isNaN(t20) || isNaN(t40) || isNaN(vwc)) continue;
+      const t20 = parseFloat(v1), t40 = parseFloat(v2);
+      if (isNaN(t20) || isNaN(t40)) continue;
+      // VWC optional — use 0 as sentinel if missing; display will show N/A
+      const vwc = (v3 !== undefined && v3 !== "" && !isNaN(parseFloat(v3))) ? parseFloat(v3) : 0;
       result.push({ date: dateStr, t20, t40, vwc });
     }
     return result.sort((a, b) => a.date.localeCompare(b.date));
@@ -301,24 +323,26 @@ function checkOverrideStuck(eng, day) {
 }
 
 function calculateWaterUsage(eng, day) {
-  const dischargeLph = eng.cfg.dischargeLph || E.WATER_DISCHARGE_LPH;
+  const perDripperLph = eng.cfg.dischargeLph || E.WATER_DISCHARGE_LPH;
   const numDrippers = eng.cfg.drippers || E.WATER_NUM_DRIPPERS;
-  const fieldHa = E.WATER_FIELD_HA;
+  // PLANNED: what the controller commanded
+  // perDripperLph [L/h] × pulses × (sec/3600) [h per pulse] × drippers = total litres per day
+  const plannedLiters = (perDripperLph / 3600) * eng.program.pulses * eng.program.sec * numDrippers;
 
-  // Planned: (lph / 3600) × pulses × sec × drippers → liters per day for whole field
-  const plannedLiters = (dischargeLph / 3600) * eng.program.pulses * eng.program.sec * numDrippers;
-  const plannedPerHa = plannedLiters / fieldHa;
+  // ACTUAL: independently simulated based on system health & random factors
+  let actualLiters = 0;
 
-  // Actual: planned with variance
-  let actualLiters = plannedLiters;
-
-  // If frozen, no water delivered
   if (eng.frozen) {
+    // Frozen: no water delivered
     actualLiters = 0;
   } else {
-    // Check for pump failure or clog
+    // Initialize system health tracking if needed
+    if (eng.pumpFailureDay === null && eng.clogDay === null && !eng.pumpEfficiency) {
+      eng.pumpEfficiency = 0.98; // Start at 98% efficiency
+    }
+
+    // Check for failures (1% chance each day)
     if (eng.pumpFailureDay === null && eng.clogDay === null) {
-      // 1% chance of pump failure or clog starting
       if (Math.random() < E.WATER_PUMP_FAILURE_PROB) {
         if (Math.random() < 0.5) {
           eng.pumpFailureDay = day;
@@ -330,20 +354,28 @@ function calculateWaterUsage(eng, day) {
       }
     }
 
-    if (eng.pumpFailureDay !== null) {
-      // Pump failure: 0 delivery
-      actualLiters = 0;
-    } else if (eng.clogDay !== null) {
-      // Clog: 20% delivery (70% reduction)
-      actualLiters *= 0.3;
-    } else {
-      // Normal variance: ±7.5% (normal distribution)
-      const variance = (Math.random() - 0.5) * 2 * E.WATER_NORMAL_VARIANCE;
-      actualLiters *= (1 + variance);
-    }
-  }
+    // Calculate actual based on system state
+    let systemEfficiency = 1.0;
 
-  const actualPerHa = actualLiters / fieldHa;
+    if (eng.pumpFailureDay !== null) {
+      // Pump failure: no delivery
+      systemEfficiency = 0;
+    } else if (eng.clogDay !== null) {
+      // Clog: progressive degradation (starts at 80%, degrades 5% per day)
+      const clogDays = day - eng.clogDay;
+      systemEfficiency = Math.max(0.2, 0.8 - clogDays * 0.05);
+    } else {
+      // Normal operation with pump degradation + sensor error
+      if (!eng.pumpEfficiency) eng.pumpEfficiency = 0.98;
+      eng.pumpEfficiency = Math.max(0.90, eng.pumpEfficiency - Math.random() * 0.001); // Gradual degradation
+
+      // Random sensor/measurement error: ±5%
+      const sensorError = (Math.random() - 0.5) * 2 * 0.05;
+      systemEfficiency = eng.pumpEfficiency + sensorError;
+    }
+
+    actualLiters = plannedLiters * systemEfficiency;
+  }
 
   // Check mismatch (>20% deviation)
   const deviation = plannedLiters > 0 ? Math.abs(actualLiters - plannedLiters) / plannedLiters : 0;
@@ -358,7 +390,7 @@ function calculateWaterUsage(eng, day) {
   }
 
   eng.waterUsageHistory.push({
-    day, plannedLiters, plannedPerHa, actualLiters, actualPerHa, deviation, mismatch
+    day, plannedLiters, actualLiters, deviation, mismatch
   });
 }
 
@@ -372,9 +404,9 @@ function processDay(eng, r, day) {
   calculateWaterUsage(eng, day);
 
   const litres = eng.cfg.dischargeLph > 0
-    ? eng.program.pulses * (eng.program.sec / 3600) * eng.cfg.dischargeLph
+    ? eng.program.pulses * (eng.program.sec / 3600) * eng.cfg.dischargeLph * (eng.cfg.drippers || E.WATER_NUM_DRIPPERS)
     : 0;
-  const prog = `${eng.program.pulses} pulses × ${eng.program.sec}s  (~${litres.toFixed(2)} L/day)`;
+  const prog = `${eng.program.pulses} pulses × ${eng.program.sec}s  (~${litres.toFixed(0)} L/day)`;
 
   // Header line for this day's log entry
   eng.logBuffer.push(`${"=".repeat(60)}`);
@@ -544,6 +576,41 @@ function exportDecisionLog(logEntries, soilType, fileName) {
 const card = { background: C.surface, border: `1px solid ${C.border}`, borderRadius: 10, overflow: "hidden" };
 const labelStyle = { fontSize: 15, fontWeight: 700, letterSpacing: "0.13em", textTransform: "uppercase", color: C.sub };
 
+// Small hover tooltip balloon
+function Tip({ text, children, width = 200, align = "center" }) {
+  const [show, setShow] = useState(false);
+  const left = align === "left" ? 0 : align === "right" ? "auto" : "50%";
+  const right = align === "right" ? 0 : "auto";
+  const transform = align === "center" ? "translateX(-50%)" : "none";
+  return (
+    <span style={{ position: "relative", display: "inline-flex", alignItems: "center" }}
+      onMouseEnter={() => setShow(true)} onMouseLeave={() => setShow(false)}>
+      {children}
+      {show && (
+        <div style={{
+          position: "absolute", bottom: "calc(100% + 7px)",
+          left, right, transform,
+          width, background: C.surface, border: `1px solid ${C.border}55`,
+          borderRadius: 7, padding: "7px 10px", fontSize: 13, color: C.sub,
+          lineHeight: 1.55, zIndex: 200, pointerEvents: "none",
+          boxShadow: "0 6px 18px #0009", whiteSpace: "normal",
+        }}>
+          {text}
+          <div style={{
+            position: "absolute", top: "100%",
+            left: align === "center" ? "50%" : align === "left" ? 16 : "auto",
+            right: align === "right" ? 16 : "auto",
+            transform: align === "center" ? "translateX(-50%)" : "none",
+            width: 0, height: 0,
+            borderLeft: "5px solid transparent", borderRight: "5px solid transparent",
+            borderTop: `5px solid ${C.border}55`,
+          }} />
+        </div>
+      )}
+    </span>
+  );
+}
+
 function fmtProgram(p) {
   if (p.pulses <= 0) return "0 pulses · tap off";
   const interval = (1440 / p.pulses).toFixed(1);
@@ -554,6 +621,8 @@ function fmtProgram(p) {
 export default function SensAItionSimulator() {
   const [soilType, setSoilType] = useState("medium");
   const [numDrippers, setNumDrippers] = useState(10000);
+  const [dripperFlowLph, setDripperFlowLph] = useState(1.0);
+  const [etLevel, setEtLevel] = useState("medium");
   const [engineState, setEngineState] = useState(null);
   const [soilState, setSoilState] = useState(null);
   const [day, setDay] = useState(0);
@@ -581,10 +650,10 @@ export default function SensAItionSimulator() {
   const [showStart, setShowStart] = useState(false);
   const [showGuide, setShowGuide] = useState(false);
   const [showFreeze, setShowFreeze] = useState(false);
+  const [showReset, setShowReset] = useState(false);
   const [showOverride, setShowOverride] = useState(false);
   const [showExit, setShowExit] = useState(false);
-
-  const [ovPulses, setOvPulses] = useState(150);
+    const [ovPulses, setOvPulses] = useState(150);
   const [ovSec, setOvSec] = useState(30);
 
   const engRef = useRef(null);
@@ -595,7 +664,7 @@ export default function SensAItionSimulator() {
   const reset = useCallback((st) => {
     const cfg = {
       soilType: st, has40cm: st !== "soilless", extPulse: false,
-      cal2MaxDays: 14, dischargeLph: 1.0, drippers: numDrippers,
+      cal2MaxDays: 14, dischargeLph: dripperFlowLph, drippers: numDrippers,
     };
     const eng = makeEngine(cfg);
     const soil = makeSoil(st);
@@ -604,9 +673,9 @@ export default function SensAItionSimulator() {
     setEngineState({ ...eng }); setSoilState({ ...soil });
     setDay(0); setHistory([]); setDailyAvgHistory([]); setAlerts([]);
     setDecisionLog([]); setRunning(false); setUploadDayIdx(0); setTick(t => t + 1);
-  }, [numDrippers]);
+  }, [numDrippers, dripperFlowLph]);
 
-  useEffect(() => { reset(soilType); }, [soilType, numDrippers, reset]);
+  useEffect(() => { reset(soilType); }, [soilType, numDrippers, dripperFlowLph, reset]);
 
   // file upload handler
   const handleFileUpload = useCallback((e) => {
@@ -640,6 +709,21 @@ export default function SensAItionSimulator() {
     reset(soilType);
   }, [soilType, reset]);
 
+  // CSV export of daily history
+  const exportCSV = useCallback(() => {
+    if (dailyAvgHistory.length === 0) return;
+    const header = "day,date,stage,T20_mb,T40_mb,VWC_pct,pulses,total_L_day";
+    const rows = dailyAvgHistory.map(h =>
+      `${h.day},${h.date || ""},${h.stage},${h.t20.toFixed(2)},${h.t40.toFixed(2)},${h.vwc.toFixed(2)},${h.pulses},${(h.litres_day||0).toFixed(0)}`
+    );
+    const csv = [header, ...rows].join("\n");
+    const blob = new Blob([csv], { type: "text/csv" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url; a.download = `sensation_daily_history_day${day}.csv`; a.click();
+    URL.revokeObjectURL(url);
+  }, [dailyAvgHistory, day]);
+
   // simulation step — uses uploaded data or soil simulator
   const stepOnce = useCallback(() => {
     const eng = engRef.current, soil = soilRef.current;
@@ -666,7 +750,12 @@ export default function SensAItionSimulator() {
         return;
       }
       const eff = effectiveProgram(eng);
-      const newSoil = stepSoil(soil, eff, eng.cfg.dischargeLph, eng.frozen);
+      // Soil physics uses per-dripper flow only — the local tensiometer near one dripper
+      // is unaffected by how many drippers are in the field.
+      // Total field water (for usage reporting) = dripper_flow × num_drippers.
+      const perDripperLph = eng.cfg.dischargeLph || E.WATER_DISCHARGE_LPH;
+      const totalDischargeLph = perDripperLph * (eng.cfg.drippers || E.WATER_NUM_DRIPPERS);
+      const newSoil = stepSoil(soil, eff, perDripperLph, eng.frozen, etLevel);
       soilRef.current = newSoil;
       setSoilState({ ...newSoil });
       const base = soilReadings(newSoil);
@@ -688,13 +777,14 @@ export default function SensAItionSimulator() {
       t20: dayAvg.t20, t40: dayAvg.t40, vwc: dayAvg.vwc,
       pulses: eng.program.pulses, stage: eng.stage,
     }].slice(-120));
+    const _litresDay = eng.program.pulses * (eng.program.sec / 3600) * (eng.cfg.dischargeLph || E.WATER_DISCHARGE_LPH) * (eng.cfg.drippers || E.WATER_NUM_DRIPPERS);
     setDailyAvgHistory(h => [...h, {
       day: d, t20: dayAvg.t20, t40: dayAvg.t40, vwc: dayAvg.vwc,
       n: dayAvg.n ?? READINGS_PER_DAY, stage: eng.stage, pulses: eng.program.pulses,
-      date: dayAvg.date,
+      date: dayAvg.date, litres_day: _litresDay,
     }].slice(-180));
     setTick(t => t + 1);
-  }, []);
+  }, [etLevel]);
 
   useEffect(() => {
     if (!running) return;
@@ -742,64 +832,141 @@ export default function SensAItionSimulator() {
     <div style={{ background: C.bg, minHeight: "100vh", color: C.chalk,
       fontFamily: "'Inter','SF Pro Display',system-ui,sans-serif", padding: 0 }}>
 
-      {/* ── TOP BAR ── */}
+      {/* ── TOP BAR ROW 1: identity + status + data I/O ── */}
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between",
-        padding: "10px 20px", borderBottom: `1px solid ${C.border}` }}>
-        {/* Left: SensAItion logo + title */}
+        padding: "10px 20px 8px", borderBottom: `1px solid ${C.border}` }}>
+
+        {/* Left: logo + title */}
         <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
           <img src={LOGO_B64} alt="SensAItion"
             style={{ height: 108, borderRadius: 6, background: "#fff", padding: "3px 6px", objectFit: "contain" }} />
           <div>
-            
-            <div style={{ fontSize: 30, color: C.dim, marginTop: 1 }}>Agronomist Simulator <span style={{ fontSize: 24, color: C.sub, marginLeft: 6 }}>v3.0</span></div>
+            <div style={{ fontSize: 30, color: C.dim, marginTop: 1 }}>
+              Agronomist Simulator <span style={{ fontSize: 24, color: C.sub, marginLeft: 6 }}>v3.0</span>
+            </div>
           </div>
         </div>
-        {/* Right: controls */}
-        <div style={{ display: "flex", alignItems: "center", gap: 12, fontSize: 18, color: C.sub }}>
-          <span>Day <strong style={{ color: C.chalk, fontVariantNumeric: "tabular-nums" }}>{day}</strong></span>
 
-          {/* File mode badge */}
+        {/* Right: day counter · file badge · I/O buttons */}
+        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          <span style={{ fontSize: 18, color: C.sub }}>
+            Day <strong style={{ color: C.chalk, fontVariantNumeric: "tabular-nums" }}>{day}</strong>
+          </span>
+
           {isFileMode && (
             <div style={{ display: "flex", alignItems: "center", gap: 6,
               background: `${C.blue}22`, border: `1px solid ${C.blue}55`,
-              borderRadius: 6, padding: "4px 10px", fontSize: 16.5 }}>
+              borderRadius: 6, padding: "4px 10px", fontSize: 16 }}>
               <span style={{ color: C.blue }}>📂</span>
               <span style={{ color: C.blue, fontWeight: 600 }}>{uploadFileName}</span>
               <span style={{ color: C.dim }}>({uploadDayIdx}/{uploadedData.length} days)</span>
               <button onClick={clearUpload} style={{ background: "none", border: "none",
-                color: C.dim, cursor: "pointer", fontSize: 18, padding: 0, marginLeft: 2 }}>✕</button>
+                color: C.dim, cursor: "pointer", fontSize: 17, padding: 0, marginLeft: 2 }}>✕</button>
             </div>
           )}
 
-          {/* File upload button */}
           <label style={{ display: "flex", alignItems: "center", gap: 5,
             background: C.raised, border: `1px solid ${C.border}`,
-            borderRadius: 6, padding: "5px 10px", fontSize: 16.5, cursor: "pointer",
+            borderRadius: 6, padding: "5px 12px", fontSize: 16, cursor: "pointer",
             color: C.sub, fontWeight: 600 }}>
-            <span>📥 Load data file</span>
-            <input type="file" accept=".csv,.txt" onChange={handleFileUpload}
-              style={{ display: "none" }} />
+            📥 Load data file
+            <input type="file" accept=".csv,.txt" onChange={handleFileUpload} style={{ display: "none" }} />
           </label>
 
-          <select value={soilType} onChange={e => setSoilType(e.target.value)}
-            style={{ background: C.raised, color: C.chalk, border: `1px solid ${C.border}`,
-              borderRadius: 6, padding: "5px 8px", fontSize: 18 }}>
-            <option value="medium">Medium soil</option>
-            <option value="heavy">Heavy soil</option>
-            <option value="sandy">Sandy soil</option>
-            <option value="soilless">Soilless</option>
-          </select>
+          {dailyAvgHistory.length > 0 && (
+            <button onClick={exportCSV} style={{
+              background: `${C.green}22`, border: `1px solid ${C.green}55`,
+              borderRadius: 6, padding: "5px 12px", fontSize: 16,
+              color: C.green, fontWeight: 600, cursor: "pointer" }}>
+              ⬇ Export CSV
+            </button>
+          )}
+        </div>
+      </div>
 
-          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-            <span style={{ fontSize: 17, color: C.sub }}>Drippers:</span>
-            <button onClick={() => setNumDrippers(d => Math.max(100, d - 100))}
-              style={{ background: C.raised, color: C.chalk, border: `1px solid ${C.border}`,
-                borderRadius: 6, padding: "3px 10px", fontSize: 18, cursor: "pointer" }}>−</button>
-            <span style={{ fontSize: 19, fontWeight: 700, minWidth: 54, textAlign: "center",
-              color: C.chalk, fontVariantNumeric: "tabular-nums" }}>{numDrippers.toLocaleString()}</span>
-            <button onClick={() => setNumDrippers(d => d + 100)}
-              style={{ background: C.raised, color: C.chalk, border: `1px solid ${C.border}`,
-                borderRadius: 6, padding: "3px 10px", fontSize: 18, cursor: "pointer" }}>+</button>
+      {/* ── TOP BAR ROW 2: field configuration ── */}
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between",
+        padding: "8px 20px", borderBottom: `1px solid ${C.border}`,
+        background: C.raised, gap: 16 }}>
+
+        {/* Group: Field */}
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <span style={{ fontSize: 13, fontWeight: 700, letterSpacing: "0.1em",
+            textTransform: "uppercase", color: C.dim, marginRight: 2 }}>Field</span>
+
+          <Tip width={230} align="left" text={{
+            medium:   "Loam/mixed soil. Optimal VWC 40–50%. Balanced drainage and retention.",
+            heavy:    "Clay-heavy soil. Optimal VWC ≥50%. Drains slowly — over-saturation risk.",
+            sandy:    "Fast-draining soil. Optimal VWC 30–35%. Needs frequent short pulses.",
+            soilless: "Substrate / hydroponics. Optimal VWC 30–50%. No 40cm tensiometer.",
+          }[soilType]}>
+            <select value={soilType} onChange={e => setSoilType(e.target.value)}
+              style={{ background: C.surface, color: C.chalk, border: `1px solid ${C.border}`,
+                borderRadius: 6, padding: "4px 8px", fontSize: 16 }}>
+              <option value="medium">Medium soil</option>
+              <option value="heavy">Heavy soil</option>
+              <option value="sandy">Sandy soil</option>
+              <option value="soilless">Soilless</option>
+            </select>
+          </Tip>
+
+          {/* ET level */}
+          <div style={{ display: "flex", alignItems: "center", gap: 5,
+            background: C.surface, border: `1px solid ${C.border}`, borderRadius: 6, padding: "3px 8px" }}>
+            <span style={{ fontSize: 15, color: C.sub, fontWeight: 600 }}>☀ ET</span>
+            {[
+              { lv: "low",    tip: "Cooler / humid season — soil dries at half speed. More time between irrigations." },
+              { lv: "medium", tip: "Baseline conditions — standard drying rate. Default for most scenarios." },
+              { lv: "high",   tip: "Hot / dry season — soil dries 50% faster. Algorithm irrigates more aggressively." },
+            ].map(({ lv, tip }) => (
+              <Tip key={lv} text={tip} width={190} align="center">
+                <button onClick={() => setEtLevel(lv)} style={{
+                  background: etLevel === lv ? `${C.amber}33` : "none",
+                  border: `1px solid ${etLevel === lv ? C.amber : C.border}`,
+                  borderRadius: 4, color: etLevel === lv ? C.amber : C.sub,
+                  cursor: "pointer", padding: "1px 8px", fontSize: 14,
+                  fontWeight: etLevel === lv ? 700 : 400 }}>
+                  {lv}
+                </button>
+              </Tip>
+            ))}
+          </div>
+        </div>
+
+        {/* Divider */}
+        <div style={{ width: 1, height: 28, background: C.border }} />
+
+        {/* Group: Irrigation hardware */}
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <span style={{ fontSize: 13, fontWeight: 700, letterSpacing: "0.1em",
+            textTransform: "uppercase", color: C.dim, marginRight: 2 }}>Irrigation</span>
+
+          {/* Drippers */}
+          <div style={{ display: "flex", alignItems: "center", gap: 5,
+            background: C.surface, border: `1px solid ${C.border}`, borderRadius: 6, padding: "3px 8px" }}>
+            <span style={{ fontSize: 15, color: C.sub, fontWeight: 600 }}>💧 Drippers</span>
+            <button onClick={() => setNumDrippers(n => Math.max(100, n - 100))}
+              style={{ background: "none", border: `1px solid ${C.border}`, borderRadius: 4,
+                color: C.chalk, cursor: "pointer", padding: "1px 6px", fontSize: 15 }}>−</button>
+            <span style={{ color: C.chalk, fontWeight: 700, minWidth: 52, textAlign: "center",
+              fontSize: 15, fontVariantNumeric: "tabular-nums" }}>{numDrippers.toLocaleString()}</span>
+            <button onClick={() => setNumDrippers(n => n + 100)}
+              style={{ background: "none", border: `1px solid ${C.border}`, borderRadius: 4,
+                color: C.chalk, cursor: "pointer", padding: "1px 6px", fontSize: 15 }}>+</button>
+          </div>
+
+          {/* Flow rate */}
+          <div style={{ display: "flex", alignItems: "center", gap: 5,
+            background: C.surface, border: `1px solid ${C.border}`, borderRadius: 6, padding: "3px 8px" }}>
+            <span style={{ fontSize: 15, color: C.sub, fontWeight: 600 }}>⚡ Flow</span>
+            <button onClick={() => setDripperFlowLph(f => Math.max(0.25, parseFloat((f - 0.25).toFixed(2))))}
+              style={{ background: "none", border: `1px solid ${C.border}`, borderRadius: 4,
+                color: C.chalk, cursor: "pointer", padding: "1px 6px", fontSize: 15 }}>−</button>
+            <span style={{ color: C.chalk, fontWeight: 700, minWidth: 48, textAlign: "center",
+              fontSize: 15, fontVariantNumeric: "tabular-nums" }}>{dripperFlowLph.toFixed(2)} L/h</span>
+            <button onClick={() => setDripperFlowLph(f => parseFloat((f + 0.25).toFixed(2)))}
+              style={{ background: "none", border: `1px solid ${C.border}`, borderRadius: 4,
+                color: C.chalk, cursor: "pointer", padding: "1px 6px", fontSize: 15 }}>+</button>
           </div>
         </div>
       </div>
@@ -871,6 +1038,21 @@ export default function SensAItionSimulator() {
               ⏱ Change staged — applies next midnight (Day {day + 1})
             </div>
           )}
+          {eng.stage !== "awaiting" && (
+            <div style={{ display: "flex", gap: 8, flexShrink: 0 }}>
+              {eng.overrideMode === "none" ? (
+                <button onClick={() => setShowOverride(true)} style={btn(C.purple, "#fff")}>✋ Manual override</button>
+              ) : (
+                <button onClick={() => setShowExit(true)} style={btn(C.purple, "#fff")}>↩ Exit override</button>
+              )}
+              {!eng.frozen ? (
+                <button onClick={() => setShowFreeze(true)} style={btn(`${C.frost}22`, C.frost)}>❄ Freeze irrigation</button>
+              ) : (
+                <button onClick={() => { unfreeze(engRef.current); setEngineState({ ...engRef.current }); }}
+                  style={btn(C.frost, C.bg)}>❄ Unfreeze</button>
+              )}
+            </div>
+          )}
         </div>
 
         {/* ── CONTROLS ROW ── */}
@@ -884,6 +1066,7 @@ export default function SensAItionSimulator() {
               <button onClick={() => setRunning(r => !r)} style={btn(running ? C.raised : C.green, running ? C.chalk : C.bg)}>
                 {running ? "❚❚ Pause sim" : "▶ Run sim"}
               </button>
+              <button onClick={() => setShowReset(true)} style={btnGhost}>↺ Reset</button>
               <div style={{ flex: 1 }} />
               {/* Decision log export */}
               <button onClick={() => setShowLog(l => !l)}
@@ -897,18 +1080,6 @@ export default function SensAItionSimulator() {
                   📄 Export Log
                 </button>
               )}
-              {eng.overrideMode === "none" ? (
-                <button onClick={() => setShowOverride(true)} style={btn(C.purple, "#fff")}>✋ Manual override</button>
-              ) : (
-                <button onClick={() => setShowExit(true)} style={btn(C.purple, "#fff")}>↩ Exit override</button>
-              )}
-              {!eng.frozen ? (
-                <button onClick={() => setShowFreeze(true)} style={btn(`${C.frost}22`, C.frost)}>❄ Freeze irrigation</button>
-              ) : (
-                <button onClick={() => { unfreeze(engRef.current); setEngineState({ ...engRef.current }); }}
-                  style={btn(C.frost, C.bg)}>❄ Unfreeze</button>
-              )}
-              <button onClick={() => reset(soilType)} style={btnGhost}>↺ Reset</button>
             </>
           )}
         </div>
@@ -1165,7 +1336,7 @@ export default function SensAItionSimulator() {
               )}
             </div>
 
-            {/* System configuration info */}
+            {/* System configuration info (ported from 02_simulator_ui) */}
             <div style={{ padding: "10px 16px", background: C.raised, borderBottom: `1px solid ${C.border}`, fontSize: 13, color: C.sub, display: "flex", gap: 20, flexWrap: "wrap" }}>
               <div><strong>Dripper rate:</strong> {eng.cfg.dischargeLph || E.WATER_DISCHARGE_LPH} L/h</div>
               <div><strong>Drippers:</strong> {eng.cfg.drippers || E.WATER_NUM_DRIPPERS}</div>
@@ -1191,20 +1362,20 @@ export default function SensAItionSimulator() {
                     <div style={{ textAlign: "center", padding: "12px", background: C.raised, borderRadius: 6, border: `1px solid ${C.green}33` }}>
                       <div style={{ fontSize: 12, color: C.sub, marginBottom: 8, textTransform: "uppercase", letterSpacing: "0.05em" }}>Planned</div>
                       <div style={{ fontSize: 32, fontWeight: 800, color: C.green, fontVariantNumeric: "tabular-nums" }}>
-                        {latest.plannedPerHa.toFixed(0)}
+                        {(latest.plannedLiters / 1000).toFixed(1)}
                       </div>
-                      <div style={{ fontSize: 11, color: C.dim, marginTop: 4 }}>L/ha</div>
-                      <div style={{ fontSize: 13, color: C.sub, marginTop: 6, fontVariantNumeric: "tabular-nums" }}>{(latest.plannedLiters / 1000).toFixed(1)} m³/day</div>
+                      <div style={{ fontSize: 11, color: C.dim, marginTop: 4 }}>m³/day</div>
+                      <div style={{ fontSize: 13, color: C.sub, marginTop: 6, fontVariantNumeric: 'tabular-nums' }}>{(latest.plannedLiters / E.WATER_FIELD_HA).toFixed(0)} L/ha</div>
                     </div>
 
                     {/* Actual */}
                     <div style={{ textAlign: "center", padding: "12px", background: C.raised, borderRadius: 6, border: `1px solid ${statusColor}33` }}>
                       <div style={{ fontSize: 12, color: C.sub, marginBottom: 8, textTransform: "uppercase", letterSpacing: "0.05em" }}>Actual</div>
                       <div style={{ fontSize: 32, fontWeight: 800, color: statusColor, fontVariantNumeric: "tabular-nums" }}>
-                        {latest.actualPerHa.toFixed(0)}
+                        {(latest.actualLiters / 1000).toFixed(1)}
                       </div>
-                      <div style={{ fontSize: 11, color: C.dim, marginTop: 4 }}>L/ha</div>
-                      <div style={{ fontSize: 13, color: C.sub, marginTop: 6, fontVariantNumeric: "tabular-nums" }}>{(latest.actualLiters / 1000).toFixed(1)} m³/day</div>
+                      <div style={{ fontSize: 11, color: C.dim, marginTop: 4 }}>m³/day</div>
+                      <div style={{ fontSize: 13, color: C.sub, marginTop: 6, fontVariantNumeric: 'tabular-nums' }}>{(latest.actualLiters / E.WATER_FIELD_HA).toFixed(0)} L/ha</div>
                     </div>
 
                     {/* Deviation */}
@@ -1221,14 +1392,14 @@ export default function SensAItionSimulator() {
                   <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
                     <div style={{ flex: 1, height: 8, background: C.raised, borderRadius: 4, overflow: "hidden" }}>
                       <div style={{
-                        width: `${Math.min(latest.actualPerHa / latest.plannedPerHa * 100, 150)}%`,
+                        width: `${Math.min(latest.actualLiters / latest.plannedLiters * 100, 150)}%`,
                         height: "100%",
                         background: statusColor,
                         transition: "width 0.3s ease"
                       }} />
                     </div>
                     <div style={{ fontSize: 12, color: C.sub, minWidth: 40, textAlign: "right" }}>
-                      {(latest.actualPerHa / latest.plannedPerHa * 100).toFixed(0)}%
+                      {(latest.actualLiters / latest.plannedLiters * 100).toFixed(0)}%
                     </div>
                   </div>
                 </div>
@@ -1236,8 +1407,8 @@ export default function SensAItionSimulator() {
             })()}
             {eng.waterUsageHistory.length > 0 && (
               <div style={{ padding: "10px 16px", background: C.raised, borderTop: `1px solid ${C.border}`, fontSize: 15, color: C.sub, display: "flex", justifyContent: "space-between" }}>
-                <span>Cumulative: <strong style={{ color: C.chalk }}>{eng.waterUsageHistory.reduce((a, w) => a + w.plannedLiters, 0).toFixed(0)} L</strong> · <strong style={{ color: C.chalk }}>{(eng.waterUsageHistory.reduce((a, w) => a + w.plannedLiters, 0) / 1000).toFixed(1)} m³</strong> planned</span>
-                <span><strong style={{ color: C.chalk }}>{eng.waterUsageHistory.reduce((a, w) => a + w.actualLiters, 0).toFixed(0)} L</strong> · <strong style={{ color: C.chalk }}>{(eng.waterUsageHistory.reduce((a, w) => a + w.actualLiters, 0) / 1000).toFixed(1)} m³</strong> actual</span>
+                <span>Cumulative planned: <strong style={{ color: C.chalk }}>{(eng.waterUsageHistory.reduce((a, w) => a + w.plannedLiters, 0) / 1000).toFixed(1)} m³</strong></span>
+                <span>Actual: <strong style={{ color: C.chalk }}>{(eng.waterUsageHistory.reduce((a, w) => a + w.actualLiters, 0) / 1000).toFixed(1)} m³</strong></span>
               </div>
             )}
           </div>
@@ -1259,7 +1430,7 @@ export default function SensAItionSimulator() {
 
         <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 }}>
           <div style={{ ...card, padding: "14px 16px" }}>
-            <div style={labelStyle}>Override snapshot &amp; baseline</div>
+            <div style={labelStyle}>Override snapshot</div>
             {eng.overrideMode === "none" && !eng.snapshot ? (
               <div style={{ fontSize: 19.5, color: C.dim, marginTop: 10 }}>No override active.</div>
             ) : (
@@ -1342,13 +1513,27 @@ export default function SensAItionSimulator() {
         </Modal>
       )}
 
+      {showReset && (
+        <Modal onClose={() => setShowReset(false)}>
+          <h3 style={{ fontSize: 24, fontWeight: 700, margin: "0 0 8px", color: C.red }}>↺ Restart system?</h3>
+          <p style={{ fontSize: 19.5, color: C.sub, lineHeight: 1.6, margin: "0 0 18px" }}>
+            This wipes all progress — stage, calibration history, alerts, decision log, water usage — and starts over from Awaiting Start. This cannot be undone.
+          </p>
+          <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
+            <button onClick={() => setShowReset(false)} style={btnGhost}>Cancel</button>
+            <button onClick={() => { reset(soilType); setShowReset(false); }}
+              style={btn(C.red, "#fff")}>Confirm restart</button>
+          </div>
+        </Modal>
+      )}
+
       {showOverride && (
         <Modal onClose={() => setShowOverride(false)} wide>
           <h3 style={{ fontSize: 24, fontWeight: 700, margin: "0 0 4px", color: C.purple }}>Manual override</h3>
           <p style={{ fontSize: 18, color: C.sub, margin: "0 0 16px" }}>
-            Saves an auto snapshot first, then stages your values. Auto program paused until you resume.
-            Takes effect at the next midnight cycle.
+            System saves a snapshot first, then stages your values. Takes effect at the next midnight cycle.
           </p>
+          <div style={{ ...labelStyle, marginBottom: 8 }}>Override mode</div>
           <div style={{ padding: "12px 14px", borderRadius: 8, background: `${C.purple}1A`,
             border: `1.5px solid ${C.purple}`, marginBottom: 18 }}>
             <div style={{ fontWeight: 700, fontSize: 19.5, color: C.purple }}>✋ Full Manual</div>

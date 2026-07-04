@@ -245,3 +245,24 @@ def alert_override_stuck_3_days(state: SystemState, mode: str, days: int) -> Ale
         f"System has been in {mode} manual override for {days} days "
         "without reverting to auto. Consider resuming automatic control."
     )
+
+
+# ---------------------------------------------------------------------------
+# Sensor-fault / implausible-reading alert (controller requirement: "read
+# health of the sensors -- faulty/working/unplausible readings"). Tensiometer
+# readings outside 0-200mb and VWC outside 0-100% are excluded from the daily
+# average by compute_daily_average(); this alert tells the administrator why.
+# ---------------------------------------------------------------------------
+
+def alert_sensor_fault(
+    state: SystemState,
+    sensor_name: str,
+    anomaly_count: int,
+    total_readings: int,
+) -> Alert:
+    return _alert(
+        state, AlertLevel.RED,
+        f"{sensor_name}: {anomaly_count}/{total_readings} readings today were outside "
+        "the physically plausible range -- malfunction suspected. Anomalous readings "
+        "were excluded from today's average. Check sensor wiring/calibration."
+    )

@@ -26,6 +26,8 @@ from .alerts import (
     alert_vwc_not_rising,
     alert_cal3_no_stabilisation,
     alert_override_stuck_3_days,
+    alert_sensor_fault,
+    alert_discharge_mismatch,
 )
 
 # ---------------------------------------------------------------------------
@@ -103,7 +105,8 @@ class IrrigationEngine:
         state.daily_averages for UI display ("every passing day").
 
         Order of operations:
-          1. Compute daily averages from the 144 raw readings
+          1. Compute daily averages from the 144 raw readings (excluding any
+             implausible/faulty samples -- see _check_sensor_faults)
           2. Apply any pending program staged for this cycle (midnight boundary)
           3. Run universal alerts (fire in every mode, always use daily avg)
           4. Manual-override bookkeeping (stuck-in-manual alert)
@@ -111,8 +114,11 @@ class IrrigationEngine:
         """
         now = now or datetime.now()
 
-        # 1. Compute daily average -- this is what the algorithm uses
-        day_avg = compute_daily_average(readings, now.date())
+        # 1. Compute daily average -- this is what the algorithm uses.
+        #    Implausible readings (tensiometer outside 0-200mb, VWC outside
+        #    0-100%) are excluded; if a whole sensor is bad for the day, fall
+        #    back to yesterday's average rather than deciding on garbage.
+        day_avg = compute_daily_average(readings, now.date(), fallback=self.state.last_daily_avg)
         self.state.daily_averages.append(day_avg)
         self.state.last_daily_avg = day_avg
         self.state.last_reading = readings[-1]  # most recent raw reading for display
@@ -140,6 +146,9 @@ class IrrigationEngine:
         # 2. Cycle boundary -- apply anything staged for today, once per date
         self._apply_pending_if_new_cycle(now)
 
+        # 2b. Sensor-fault / implausible-reading detection (controller requirement)
+        self._check_sensor_faults(day_avg)
+
         # 3. Universal alerts -- always checked, every mode
         if self.config.has_40cm_tensiometer:
             check_universal_sensor_alerts(self.state, avg_reading)
@@ -155,7 +164,7 @@ class IrrigationEngine:
             print(f"[FULL-MANUAL] Auto logic paused. Holding {self.state.program.describe()}")
             return self.state.program
 
-        # AUTO and SEMI_AUTO both run the stage machine using daily averages
+        # AUTO runs the stage machine using daily averages
         handler = {
             Stage.AWAITING_START: self._handle_awaiting_start,
             Stage.INITIAL:        self._handle_initial,
@@ -188,13 +197,8 @@ class IrrigationEngine:
             self.state.run_mode = {
                 OverrideMode.NONE:        RunMode.AUTO,
                 OverrideMode.FULL_MANUAL: RunMode.FULL_MANUAL,
-                OverrideMode.SEMI_AUTO:   RunMode.SEMI_AUTO,
             }[self.state.pending_override_mode]
             self.state.pending_override_mode = None
-
-        if self.state.pending_baseline is not None:
-            self.state.override_baseline = self.state.pending_baseline
-            self.state.pending_baseline = None
 
         if self.state.pending_program is not None:
             self.state.program = self.state.pending_program
@@ -265,15 +269,16 @@ class IrrigationEngine:
 
     def enter_manual_override(
         self,
-        mode: OverrideMode,
         num_pulses: int,
         pulse_duration_sec: int,
         now: Optional[datetime] = None,
     ):
+        """
+        PRD 29.6.26: only one override mode exists in the current phase --
+        Full Manual (auto logic fully paused). Semi-Auto is deferred to
+        Future Requirements and is intentionally not offered here.
+        """
         now = now or datetime.now()
-        if mode not in (OverrideMode.FULL_MANUAL, OverrideMode.SEMI_AUTO):
-            raise ValueError("Override mode must be FULL_MANUAL or SEMI_AUTO")
-
         num_pulses = max(PULSE_FLOOR, min(PULSE_CEILING, num_pulses))
 
         self.state.override_snapshot = ProgramSnapshot(
@@ -296,57 +301,39 @@ class IrrigationEngine:
             cycle_duration_min=self.config.cycle_duration_min,
         )
         self.state.pending_program       = manual_program
-        self.state.pending_override_mode = mode
-        self.state.pending_baseline      = manual_program
+        self.state.pending_override_mode = OverrideMode.FULL_MANUAL
         self.state.override_entered_at   = now
         self.state.alert_override_stuck_fired = False
 
-        print(f"[OVERRIDE] {mode.value} staged for next cycle: "
+        print(f"[OVERRIDE] full_manual staged for next cycle: "
               f"{manual_program.describe()}")
 
-    def exit_manual_override(self, exit_mode: ExitMode, now: Optional[datetime] = None):
+    def exit_manual_override(self, now: Optional[datetime] = None):
+        """PRD 29.6.26: single exit path -- 'Resume last auto' (rewind to snapshot)."""
         now = now or datetime.now()
         if self.state.override_mode == OverrideMode.NONE and self.state.pending_override_mode is None:
             print("[OVERRIDE] No active override to exit.")
             return
 
-        if exit_mode == ExitMode.RESUME_LAST_AUTO:
-            snap = self.state.override_snapshot
-            if snap is None:
-                print("[OVERRIDE] No snapshot -- cannot resume last auto.")
-                return
-            restored = IrrigationProgram(
-                num_pulses=snap.num_pulses,
-                pulse_duration_sec=snap.pulse_duration_sec,
-                cycle_duration_min=self.config.cycle_duration_min,
-            )
-            self.state.pending_program       = restored
-            self.state.pending_stage         = snap.stage
-            self.state.pending_override_mode = OverrideMode.NONE
-            self.state.pending_baseline      = None
-            self.state.stage_entered_at       = snap.stage_entered_at
-            self.state.two_week_window_start  = snap.two_week_window_start
-            self.state.vwc_at_window_start    = snap.vwc_at_window_start
-            self.state.days_below_10mb_20cm   = snap.days_below_10mb_20cm
-            self.state.days_above_40mb_20cm   = snap.days_above_40mb_20cm
-            print(f"[OVERRIDE] Resume LAST auto staged -- restoring snapshot "
-                  f"{snap.num_pulses} pulses at {snap.stage.value}")
-
-        elif exit_mode == ExitMode.RESUME_MODIFIED_AUTO:
-            baseline = self.state.override_baseline
-            if baseline is None:
-                print("[OVERRIDE] No baseline -- cannot resume modified auto.")
-                return
-            kept = IrrigationProgram(
-                num_pulses=baseline.num_pulses,
-                pulse_duration_sec=baseline.pulse_duration_sec,
-                cycle_duration_min=self.config.cycle_duration_min,
-            )
-            self.state.pending_program       = kept
-            self.state.pending_override_mode = OverrideMode.NONE
-            self.state.pending_baseline      = None
-            print(f"[OVERRIDE] Resume MODIFIED auto staged -- keeping manual baseline "
-                  f"{kept.num_pulses} pulses, {kept.pulse_duration_sec}s")
+        snap = self.state.override_snapshot
+        if snap is None:
+            print("[OVERRIDE] No snapshot -- cannot resume last auto.")
+            return
+        restored = IrrigationProgram(
+            num_pulses=snap.num_pulses,
+            pulse_duration_sec=snap.pulse_duration_sec,
+            cycle_duration_min=self.config.cycle_duration_min,
+        )
+        self.state.pending_program       = restored
+        self.state.pending_stage         = snap.stage
+        self.state.pending_override_mode = OverrideMode.NONE
+        self.state.stage_entered_at       = snap.stage_entered_at
+        self.state.two_week_window_start  = snap.two_week_window_start
+        self.state.vwc_at_window_start    = snap.vwc_at_window_start
+        self.state.days_below_10mb_20cm   = snap.days_below_10mb_20cm
+        self.state.days_above_40mb_20cm   = snap.days_above_40mb_20cm
+        print(f"[OVERRIDE] Resume LAST auto staged -- restoring snapshot "
+              f"{snap.num_pulses} pulses at {snap.stage.value}")
 
         self.state.override_snapshot   = None
         self.state.override_entered_at = None
@@ -360,6 +347,36 @@ class IrrigationEngine:
         if days >= OVERRIDE_STUCK_DAYS and not self.state.alert_override_stuck_fired:
             alert_override_stuck_3_days(self.state, self.state.override_mode.value, days)
             self.state.alert_override_stuck_fired = True
+
+    def _check_sensor_faults(self, day_avg: DailySensorAverage):
+        """
+        Controller requirement: read sensor health (faulty/working/implausible
+        readings). Fires once on ONSET of a fault day, stays silent while the
+        fault persists, and re-arms after a clean day (same pattern as the
+        universal sensor alerts). Soilless sites have no 40cm tensiometer, so
+        that check is skipped entirely for them.
+        """
+        if day_avg.t20_anomalies > 0:
+            if not self.state.alert_t20_fault_active:
+                alert_sensor_fault(self.state, "20cm tensiometer", day_avg.t20_anomalies, day_avg.num_readings)
+                self.state.alert_t20_fault_active = True
+        else:
+            self.state.alert_t20_fault_active = False
+
+        if self.config.has_40cm_tensiometer:
+            if day_avg.t40_anomalies > 0:
+                if not self.state.alert_t40_fault_active:
+                    alert_sensor_fault(self.state, "40cm tensiometer", day_avg.t40_anomalies, day_avg.num_readings)
+                    self.state.alert_t40_fault_active = True
+            else:
+                self.state.alert_t40_fault_active = False
+
+        if day_avg.vwc_anomalies > 0:
+            if not self.state.alert_vwc_fault_active:
+                alert_sensor_fault(self.state, "VWC sensor", day_avg.vwc_anomalies, day_avg.num_readings)
+                self.state.alert_vwc_fault_active = True
+        else:
+            self.state.alert_vwc_fault_active = False
 
     # ------------------------------------------------------------------
     # Irrigation Freeze (PRD 18.6.26)
@@ -376,7 +393,6 @@ class IrrigationEngine:
         self.state.run_mode = {
             OverrideMode.NONE:        RunMode.AUTO,
             OverrideMode.FULL_MANUAL: RunMode.FULL_MANUAL,
-            OverrideMode.SEMI_AUTO:   RunMode.SEMI_AUTO,
         }[self.state.override_mode]
         print("[FREEZE] Irrigation resumed.")
 
@@ -388,6 +404,52 @@ class IrrigationEngine:
                 cycle_duration_min=self.config.cycle_duration_min,
             )
         return self.state.program
+
+    # ------------------------------------------------------------------
+    # Discharge mismatch -- planned vs actual water usage (PRD)
+    # ------------------------------------------------------------------
+
+    def check_discharge(
+        self,
+        actual_liters: float,
+        elapsed_hours: float = 2.0,
+        now: Optional[datetime] = None,
+    ):
+        """
+        PRD: compare planned vs actual water discharge and alert if the
+        mismatch exceeds config.discharge_mismatch_pct (default 20%). PRD
+        specifies this check runs every 2 hours -- independent of the once-
+        a-day process_daily_reading() cycle -- so call this on whatever
+        cadence the controller/adapter reports actual discharge.
+
+        Planned volume is derived from the *effective* program (0 pulses if
+        irrigation is frozen), scaled down from a full day to `elapsed_hours`.
+        Returns the fired Alert, or None if within threshold.
+        """
+        now = now or datetime.now()
+        prog = self.effective_water_program()
+
+        full_day_on_seconds = prog.num_pulses * prog.pulse_duration_sec
+        fraction_of_day = elapsed_hours / 24.0
+        on_seconds = full_day_on_seconds * fraction_of_day
+
+        planned_liters = self.config.discharge_rate_lph * self.config.num_drippers * (on_seconds / 3600.0)
+
+        self.state.last_planned_liters = planned_liters
+        self.state.last_actual_liters = actual_liters
+
+        if planned_liters > 0:
+            pct_diff = (actual_liters - planned_liters) / planned_liters * 100.0
+        else:
+            # Nothing planned (e.g. frozen) -- any real flow is a 100% mismatch
+            pct_diff = 0.0 if actual_liters <= 0 else 100.0
+
+        self.state.last_discharge_pct_diff = pct_diff
+
+        threshold = self.config.discharge_mismatch_pct
+        if abs(pct_diff) > threshold:
+            return alert_discharge_mismatch(self.state, planned_liters, actual_liters, pct_diff, threshold)
+        return None
 
     # ------------------------------------------------------------------
     # Stage: INITIAL

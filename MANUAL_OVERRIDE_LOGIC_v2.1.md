@@ -1,32 +1,25 @@
-# Manual Override Logic — SensAItion Simulator v2.1
+# Manual Override Logic — SensAItion Simulator (PRD 29.6.26)
 
 ## Overview
 
-The manual override system allows agronomists to take temporary control of irrigation during any stage of the algorithm. It preserves full system state and enables clean exit back to the algorithm.
+The manual override system lets the agronomist take temporary, full control of irrigation during any stage of the algorithm. It preserves full system state and enables a clean, deterministic exit back to the algorithm.
+
+**Update (PRD 29.6.26):** the system now offers a single override mode — Full Manual. Semi-Auto (auto logic continues from a manual baseline) and the "Resume Modified Auto" exit were both moved to Future Requirements and are intentionally not implemented in the current phase. This doc supersedes the v2.1 description, which documented two entry modes and two exit modes that no longer exist in code.
 
 ---
 
-## Entry: Two Override Modes
+## Entry: Full Manual Override (only mode)
 
-### Semi-Auto Override
-- **Algorithm Status**: Continues running
-- **Decision Logic**: All stage transitions, thresholds, and adjustments proceed normally
-- **Manual Control**: Agronomist sets a baseline program (pulses/duration)
-- **Baseline Role**: Stored as reference only; does not constrain algorithm decisions
-- **Use Case**: Monitor/observe while algorithm runs; mark a reference tuning point
-
-### Full Manual Override
-- **Algorithm Status**: Completely paused (line 329-331: early return from decision logic)
-- **Decision Logic**: No stage transitions, no threshold evaluation, no counter updates
-- **Manual Control**: Agronomist's program runs as-is every day
-- **Counter Behavior**: `daysBelow10`, `daysAbove40`, etc. remain frozen at entry values
-- **Use Case**: Direct control; test manual irrigation scenarios; override broken algorithm state
+- **Algorithm Status**: Completely paused (auto stage transitions, thresholds, and counter updates all stop)
+- **Manual Control**: Agronomist's continuous program (pulses/duration) runs as-is every day
+- **Counter Behaviour**: `daysBelow10`, `daysAbove40`, etc. remain frozen at entry values
+- **Use Case**: Direct control; test manual irrigation scenarios; override broken algorithm state; a "mini experiment" before returning to Auto
 
 ---
 
 ## Snapshot & State Preservation
 
-On entry to any override mode:
+On entry to override:
 
 ```
 snapshot = {
@@ -46,7 +39,7 @@ The snapshot captures the **exact state at override entry**. All other state (al
 
 ## Exit Logic: Single Path
 
-**"Exit to auto"** — Restores pre-override snapshot
+**"Resume last auto"** — Restores pre-override snapshot
 
 1. Pending mode set to "none" (exit override)
 2. Pending program set to snapshot's program
@@ -56,20 +49,17 @@ The snapshot captures the **exact state at override entry**. All other state (al
 
 **Result**: System returns to exact pre-override state. Time is effectively rewound.
 
-### Counter Behavior on Exit
+### Counter Behaviour on Exit
 
-- **From Semi-Auto**: Counters (daysBelow10, daysAbove40) are restored from snapshot. Any updates during semi_auto are discarded.
-- **From Full Manual**: Counters are restored from snapshot. They were frozen during manual, so restoration just returns to entry values.
-
-**Design Rationale**: Counters freeze in full_manual because the algorithm isn't running. When exiting, the snapshot restore is clean and deterministic. No need to manually set counters.
+Counters freeze during Full Manual override (algorithm isn't running). On exit, the snapshot restore returns them to their entry values — no manual reconciliation needed.
 
 ---
 
 ## Stuck Override Alert
 
-If `overrideMode !== "none"` for ≥ `OVERRIDE_STUCK_DAYS` (currently 7 days):
-- Yellow alert fires once: *"System in [mode] manual override for X days without reverting."*
-- Reminds agronomist override is still active
+If `overrideMode !== "none"` for ≥ `OVERRIDE_STUCK_DAYS` (3 days per PRD 29.6.26 — "more than 3 consecutive days"):
+- Yellow alert fires once: *"System in Full Manual override for X days — consider reverting to Auto via 'Resume last auto'."*
+- Reminds the agronomist the override is still active
 
 ---
 
@@ -77,7 +67,7 @@ If `overrideMode !== "none"` for ≥ `OVERRIDE_STUCK_DAYS` (currently 7 days):
 
 Override changes don't apply immediately. Instead:
 
-1. User clicks "Execute" or "Exit"
+1. User clicks "Execute" or "Resume last auto"
 2. Change queued as `pending*` (pendingOverrideMode, pendingProgram, pendingStage, etc.)
 3. At next **cycle boundary** (day change):
    - Pending values applied to engine state
@@ -87,12 +77,13 @@ Override changes don't apply immediately. Instead:
 
 ---
 
-## Removed: `resume_modified_auto`
+## Removed since v2.1: `semi_auto` and `resume_modified_auto`
 
-Previously allowed exiting with manual program as new auto baseline. **Removed because**:
-- Counter freeze in full_manual meant state was corrupted on exit
-- If agronomist wants permanent tuning, that belongs in config, not override
-- Single exit path ("rewind") is simpler and safer
+PRD 29.6.26 moved both to Future Requirements:
+- **Semi-Auto** (auto logic continues from a manual baseline, program not paused) — deferred; may return as "advanced manual mode" in a later phase.
+- **Resume Modified Auto** (keep manual values as the new auto baseline on exit) — removed along with Semi-Auto, since it only made sense as a companion to it.
+
+Both the JS simulator (`src/SensAItion_Simulator.jsx`, `02_simulator_ui/SensAItion_Simulator.jsx`) and the Python reference engine (`01_engine/engine/models.py`, `algorithm.py`) have been updated to match: `OverrideMode` and `ExitMode` no longer have `SEMI_AUTO` / `RESUME_MODIFIED_AUTO` members, and `enter_manual_override()` / `exit_manual_override()` no longer take a mode parameter.
 
 ---
 
@@ -100,21 +91,21 @@ Previously allowed exiting with manual program as new auto baseline. **Removed b
 
 | Aspect | Decision | Why |
 |--------|----------|-----|
-| Semi-Auto baseline | Reference only, doesn't constrain | Keeps algorithm fully autonomous; baseline is just a marker |
+| Override mode | Full Manual only (current phase) | PRD 29.6.26 simplification; Semi-Auto deferred to Future Requirements |
 | Full Manual counters | Freeze during override | Algorithm paused, counters irrelevant; snapshot restore is clean |
-| Exit path | Single "rewind to snapshot" | Safe, deterministic, no state ambiguity |
+| Exit path | Single "resume last auto" (rewind to snapshot) | Safe, deterministic, no state ambiguity |
 | Pending application | At cycle boundary | Respects daily cycle; no mid-cycle confusion |
-| Override duration | Alert at 7+ days | Safety reminder, not forced exit |
+| Override duration | Alert at 3+ days | Matches PRD 29.6.26 wording exactly |
 
 ---
 
 ## Summary for PRD
 
 **Manual override is a testing/intervention tool:**
-- Semi-Auto: Algorithm continues, agronomist observes/marks baseline
 - Full Manual: Algorithm paused, agronomist controls directly
 - Exit: Always rewind to pre-override state (snapshot restore)
-- Counters: Freeze in full_manual, restore on exit
+- Counters: Freeze during override, restore on exit
 - Pending: Changes apply at cycle boundary
+- Stuck alert: fires once at 3+ consecutive days in override
 
 Safe, simple, reversible.

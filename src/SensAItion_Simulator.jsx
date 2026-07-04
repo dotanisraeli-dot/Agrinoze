@@ -275,16 +275,14 @@ function enterOverride(eng, pulses, sec, day) {
 }
 
 function exitOverride(eng, day) {
-  if (exitMode === "resume_last_auto") {
-    const s = eng.snapshot; if (!s) return;
-    eng.pendingProgram = { pulses: s.pulses, sec: s.sec };
-    eng.pendingStage = s.stage;
-    eng.pendingOverrideMode = "none";
-    eng.stageEnteredDay = s.stageEnteredDay;
-    eng.windowStart = s.windowStart;
-    eng.vwcAtWindowStart = s.vwcAtWindowStart;
-    eng.daysBelow10 = s.daysBelow10; eng.daysAbove40 = s.daysAbove40;
-  }
+  const s = eng.snapshot; if (!s) return;
+  eng.pendingProgram = { pulses: s.pulses, sec: s.sec };
+  eng.pendingStage = s.stage;
+  eng.pendingOverrideMode = "none";
+  eng.stageEnteredDay = s.stageEnteredDay;
+  eng.windowStart = s.windowStart;
+  eng.vwcAtWindowStart = s.vwcAtWindowStart;
+  eng.daysBelow10 = s.daysBelow10; eng.daysAbove40 = s.daysAbove40;
   eng.snapshot = null;
   eng.overrideEnteredDay = null;
 }
@@ -652,6 +650,7 @@ export default function SensAItionSimulator() {
   const [showStart, setShowStart] = useState(false);
   const [showGuide, setShowGuide] = useState(false);
   const [showFreeze, setShowFreeze] = useState(false);
+  const [showReset, setShowReset] = useState(false);
   const [showOverride, setShowOverride] = useState(false);
   const [showExit, setShowExit] = useState(false);
     const [ovPulses, setOvPulses] = useState(150);
@@ -1067,7 +1066,7 @@ export default function SensAItionSimulator() {
               <button onClick={() => setRunning(r => !r)} style={btn(running ? C.raised : C.green, running ? C.chalk : C.bg)}>
                 {running ? "❚❚ Pause sim" : "▶ Run sim"}
               </button>
-              <button onClick={() => reset(soilType)} style={btnGhost}>↺ Reset</button>
+              <button onClick={() => setShowReset(true)} style={btnGhost}>↺ Reset</button>
               <div style={{ flex: 1 }} />
               {/* Decision log export */}
               <button onClick={() => setShowLog(l => !l)}
@@ -1336,6 +1335,15 @@ export default function SensAItionSimulator() {
                 </span>
               )}
             </div>
+
+            {/* System configuration info (ported from 02_simulator_ui) */}
+            <div style={{ padding: "10px 16px", background: C.raised, borderBottom: `1px solid ${C.border}`, fontSize: 13, color: C.sub, display: "flex", gap: 20, flexWrap: "wrap" }}>
+              <div><strong>Dripper rate:</strong> {eng.cfg.dischargeLph || E.WATER_DISCHARGE_LPH} L/h</div>
+              <div><strong>Drippers:</strong> {eng.cfg.drippers || E.WATER_NUM_DRIPPERS}</div>
+              <div><strong>Field area:</strong> {E.WATER_FIELD_HA} ha</div>
+              <div><strong>Threshold:</strong> ±{(E.WATER_MISMATCH_THRESHOLD * 100).toFixed(0)}% deviation</div>
+            </div>
+
             {eng.waterUsageHistory.length > 0 && (() => {
               const latest = eng.waterUsageHistory[eng.waterUsageHistory.length - 1];
               const statusColor = latest.mismatch ? C.red : latest.deviation > 0.1 ? C.amber : C.green;
@@ -1501,6 +1509,20 @@ export default function SensAItionSimulator() {
             <button onClick={() => setShowFreeze(false)} style={btnGhost}>Cancel</button>
             <button onClick={() => { freeze(engRef.current); setEngineState({ ...engRef.current }); setShowFreeze(false); }}
               style={btn(C.frost, C.bg)}>Confirm freeze</button>
+          </div>
+        </Modal>
+      )}
+
+      {showReset && (
+        <Modal onClose={() => setShowReset(false)}>
+          <h3 style={{ fontSize: 24, fontWeight: 700, margin: "0 0 8px", color: C.red }}>↺ Restart system?</h3>
+          <p style={{ fontSize: 19.5, color: C.sub, lineHeight: 1.6, margin: "0 0 18px" }}>
+            This wipes all progress — stage, calibration history, alerts, decision log, water usage — and starts over from Awaiting Start. This cannot be undone.
+          </p>
+          <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
+            <button onClick={() => setShowReset(false)} style={btnGhost}>Cancel</button>
+            <button onClick={() => { reset(soilType); setShowReset(false); }}
+              style={btn(C.red, "#fff")}>Confirm restart</button>
           </div>
         </Modal>
       )}

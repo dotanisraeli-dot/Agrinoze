@@ -58,7 +58,7 @@ def feed(engine, t20, t40=25.0, vwc=35.0, from_day=0, n=1):
     for i in range(n):
         now = D(from_day + i)
         prog = silent(lambda: engine.process_daily_reading(
-            R(t20=t20, t40=t40, vwc=vwc, ts=now), now=now
+            [R(t20=t20, t40=t40, vwc=vwc, ts=now)], now=now
         ))
     return prog
 
@@ -898,17 +898,145 @@ def _():
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 7 — SENSOR FAULT / IMPLAUSIBLE READING DETECTION
+# Controller requirement: "read health of the sensors (faulty/working/
+# implausible readings)". Tensiometers valid 0-200mb, VWC valid 0-100%.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@test("SENSOR-FAULT: out-of-range T20 readings excluded from daily average")
+def _():
+    e = new_engine(); past_initial(e)
+    readings = [R(t20=30.0) for _ in range(140)] + [R(t20=350.0) for _ in range(4)]
+    silent(lambda: e.process_daily_reading(readings, now=D(1)))
+    avg = e.get_daily_averages()[-1]
+    assert abs(avg.t20_avg - 30.0) < 0.01, f"Expected clean 30.0 avg, got {avg.t20_avg}"
+    assert avg.t20_anomalies == 4
+
+@test("SENSOR-FAULT: negative T40 readings excluded, RED alert fired")
+def _():
+    e = new_engine(); past_initial(e)
+    readings = [R(t40=25.0) for _ in range(140)] + [R(t40=-5.0) for _ in range(4)]
+    silent(lambda: e.process_daily_reading(readings, now=D(1)))
+    assert alerts_of(e, AlertLevel.RED, "40cm tensiometer")
+
+@test("SENSOR-FAULT: VWC above 100% excluded from average, RED alert fired")
+def _():
+    e = new_engine(); past_initial(e)
+    readings = [R(vwc=35.0) for _ in range(140)] + [R(vwc=150.0) for _ in range(4)]
+    silent(lambda: e.process_daily_reading(readings, now=D(1)))
+    avg = e.get_daily_averages()[-1]
+    assert abs(avg.vwc_avg - 35.0) < 0.01
+    assert alerts_of(e, AlertLevel.RED, "VWC sensor")
+
+@test("SENSOR-FAULT: alert fires once on onset, does not spam while fault persists")
+def _():
+    e = new_engine(); past_initial(e)
+    bad = [R(t20=30.0) for _ in range(140)] + [R(t20=999.0) for _ in range(4)]
+    silent(lambda: e.process_daily_reading(bad, now=D(1)))
+    first_count = len(alerts_of(e, AlertLevel.RED, "20cm tensiometer"))
+    silent(lambda: e.process_daily_reading(bad, now=D(2)))  # still faulty -- must NOT refire
+    second_count = len(alerts_of(e, AlertLevel.RED, "20cm tensiometer"))
+    assert first_count >= 1
+    assert second_count == first_count, "Should not refire while the same fault persists"
+
+@test("SENSOR-FAULT: alert re-arms after a clean day and refires on recurrence")
+def _():
+    e = new_engine(); past_initial(e)
+    bad = [R(t20=30.0) for _ in range(140)] + [R(t20=999.0) for _ in range(4)]
+    clean = [R(t20=30.0) for _ in range(144)]
+    silent(lambda: e.process_daily_reading(bad, now=D(1)))
+    first_count = len(alerts_of(e, AlertLevel.RED, "20cm tensiometer"))
+    silent(lambda: e.process_daily_reading(clean, now=D(2)))  # clears
+    silent(lambda: e.process_daily_reading(bad, now=D(3)))    # faults again
+    second_count = len(alerts_of(e, AlertLevel.RED, "20cm tensiometer"))
+    assert second_count == first_count + 1, "Should refire after clearing and recurring"
+
+@test("SENSOR-FAULT: all-anomalous day falls back to previous day's average, not garbage")
+def _():
+    e = new_engine(); past_initial(e)
+    silent(lambda: e.process_daily_reading([R(t20=32.0) for _ in range(144)], now=D(1)))
+    all_bad = [R(t20=500.0) for _ in range(144)]
+    silent(lambda: e.process_daily_reading(all_bad, now=D(2)))
+    avg = e.get_daily_averages()[-1]
+    assert abs(avg.t20_avg - 32.0) < 0.01, f"Expected fallback to 32.0, got {avg.t20_avg}"
+    assert avg.t20_anomalies == 144
+
+@test("SENSOR-FAULT: soilless sites skip the 40cm check entirely (no such sensor)")
+def _():
+    e = new_engine(soil_type=SoilType.SOILLESS); e.config.has_40cm_tensiometer = False
+    past_initial(e)
+    readings = [R(t40=-50.0) for _ in range(144)]  # would be a T40 fault on a normal site
+    silent(lambda: e.process_daily_reading(readings, now=D(1)))
+    assert not alerts_of(e, AlertLevel.RED, "40cm tensiometer")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 8 — DISCHARGE MISMATCH (planned vs actual water usage)
+# PRD: alert if actual discharge deviates from planned by more than the
+# configurable threshold (default 20%). Checked independently of the daily
+# decision cycle (PRD specifies every 2 hours) via IrrigationEngine.check_discharge().
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _planned_2h_liters(e):
+    prog = e.current_program
+    full_day_l = e.config.discharge_rate_lph * e.config.num_drippers * (prog.num_pulses * prog.pulse_duration_sec / 3600)
+    return full_day_l * (2 / 24)
+
+@test("DISCHARGE: no alert when actual matches planned within threshold")
+def _():
+    e = new_engine(); past_initial(e)
+    planned = _planned_2h_liters(e)
+    alert = silent(lambda: e.check_discharge(actual_liters=planned * 1.05, elapsed_hours=2, now=D(1)))
+    assert alert is None
+    assert not alerts_of(e, AlertLevel.RED, "Discharge mismatch")
+
+@test("DISCHARGE: RED alert fires when actual is >20% below planned (clog/leak-low)")
+def _():
+    e = new_engine(); past_initial(e)
+    planned = _planned_2h_liters(e)
+    silent(lambda: e.check_discharge(actual_liters=planned * 0.5, elapsed_hours=2, now=D(1)))
+    assert alerts_of(e, AlertLevel.RED, "Discharge mismatch")
+
+@test("DISCHARGE: RED alert fires when actual is >20% above planned (leak-high)")
+def _():
+    e = new_engine(); past_initial(e)
+    planned = _planned_2h_liters(e)
+    silent(lambda: e.check_discharge(actual_liters=planned * 1.5, elapsed_hours=2, now=D(1)))
+    assert alerts_of(e, AlertLevel.RED, "Discharge mismatch")
+
+@test("DISCHARGE: threshold is configurable via SiteConfig.discharge_mismatch_pct")
+def _():
+    custom_cfg = SiteConfig(soil_type=SoilType.MEDIUM, water_type=WaterType.REGULAR,
+                             discharge_rate_lph=1.0, num_drippers=100, discharge_mismatch_pct=50.0)
+    e = silent(lambda: IrrigationEngine(custom_cfg))
+    silent(lambda: e.confirm_start(now=D(0)))
+    planned = _planned_2h_liters(e)
+    # 30% deviation -- under this site's custom 50% threshold, should NOT fire
+    silent(lambda: e.check_discharge(actual_liters=planned * 1.3, elapsed_hours=2, now=D(1)))
+    assert not alerts_of(e, AlertLevel.RED, "Discharge mismatch")
+
+@test("DISCHARGE: frozen irrigation expects zero planned water -- any flow alerts")
+def _():
+    e = new_engine(); past_initial(e)
+    silent(lambda: e.freeze_irrigation())
+    silent(lambda: e.check_discharge(actual_liters=5.0, elapsed_hours=2, now=D(1)))
+    assert alerts_of(e, AlertLevel.RED, "Discharge mismatch")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # RUNNER
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def run():
     sections = {
-        "PRD§":       "PRD Clause Audit",
-        "BOUNDARY":   "Boundary Conditions",
-        "COUNTER":    "Counter Logic",
-        "SCENARIO":   "Scenario Simulations",
-        "INVARIANT":  "Logical Consistency",
-        "BUG-WATCH":  "Bug Watch / Regressions",
+        "PRD§":         "PRD Clause Audit",
+        "BOUNDARY":     "Boundary Conditions",
+        "COUNTER":      "Counter Logic",
+        "SCENARIO":     "Scenario Simulations",
+        "INVARIANT":    "Logical Consistency",
+        "BUG-WATCH":    "Bug Watch / Regressions",
+        "SENSOR-FAULT": "Sensor Fault Detection",
+        "DISCHARGE":    "Discharge Mismatch",
     }
 
     print("\n" + "═"*70)

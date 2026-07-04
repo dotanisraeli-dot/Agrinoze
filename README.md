@@ -32,7 +32,9 @@ Agrinoze/
 │   │   └── test_algorithm.py      Original unit tests
 │   └── run_simulation.py     End-to-end console simulation runner
 │
-├── 02_simulator_ui/        Agronomist-facing live simulator — React (BUILT)
+├── 02_simulator_ui/        Agronomist-facing live simulator — React (BUILT). SOURCE OF TRUTH:
+│                           edit here first. src/SensAItion_Simulator.jsx is a mirror
+│                           of this file, kept identical, that Vite actually builds/deploys.
 │   └── SensAItion_Simulator.jsx   Self-contained: engine ported to JS + soil model + full control UI
 │
 ├── 03_diagrams/            Reference diagrams (PNG, SVG, PDF)
@@ -65,17 +67,20 @@ Five stages, advancing on sensor-driven triggers:
 
 ### Manual override (the centerpiece feature)
 - **On Execute:** snapshot current auto values FIRST, then stage the manual change (applies next midnight).
-- **Two entry modes:** Full Manual (auto paused) · Semi-Auto (algorithm continues from the fixed manual baseline).
-- **Two exit modes:** Resume Last Auto (restore snapshot) · Resume Modified Auto (keep manual values as baseline).
+- **PRD 29.6.26 — single mode:** Full Manual only (auto paused). Semi-Auto (algorithm continues from a manual baseline) is deferred to Future Requirements and is not implemented in the current phase.
+- **Single exit mode:** Resume Last Auto (restore snapshot). Resume Modified Auto was removed along with Semi-Auto.
+- **Stuck-in-override alert:** fires once after 3+ consecutive days without reverting to auto.
 - **Irrigation Freeze:** closes the tap (0 pulses) while timers and logic keep running.
 
 ---
 
 ## Verification status
 
-- **80/80** verification tests passing (PRD clause audit, boundary conditions, counter logic, scenarios, invariants).
+- **92/92** verification tests passing (PRD clause audit, boundary conditions, counter logic, scenarios, invariants, sensor-fault detection, discharge mismatch).
 - **Monte Carlo:** 2,000 runs × 180 days = 360,000 irrigation decisions, **zero safety violations**, pulses always within [0,200], no alert spam.
-- All four soil types (Heavy, Medium, Sandy, Soilless) verified to progress cleanly through every stage.
+- Sensor-fault detection: implausible readings (tensiometer outside 0-200mb, VWC outside 0-100%) are excluded from the daily average and raise a RED alert; an all-bad day falls back to the previous day's average instead of deciding on garbage.
+- Discharge mismatch: `IrrigationEngine.check_discharge()` compares planned vs actual water delivery and alerts (RED) if the deviation exceeds the configurable threshold (default 20%) -- call it on whatever cadence the controller reports actual discharge (PRD specifies every 2 hours).
+- Note: Monte Carlo's stage-progression numbers reflect the demo soil-physics model (see "Soil model caveat" below), not real field convergence speed -- worth validating against real sensor traces before reading too much into the % that reach Optimization within 180 days.
 
 To run:
 ```bash

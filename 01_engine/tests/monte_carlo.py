@@ -196,7 +196,7 @@ def run_one(seed: int, max_days: int = 180) -> SimRun:
         reading, t20, t40, vwc = simulate_day(profile, program, t20, t40, vwc, rng, day)
 
         # Feed to engine
-        silent(lambda r=reading, d=day: engine.process_daily_reading(r, now=D(d)))
+        silent(lambda r=reading, d=day: engine.process_daily_reading([r], now=D(d)))
 
         # --- Track stage ---
         cur_stage = engine.current_stage
