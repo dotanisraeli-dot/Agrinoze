@@ -410,6 +410,8 @@ function initFleet() {
     if (def.startDaysAgo > 0) {
       confirmStart(site.eng, 0);
       for (let d = 0; d < def.startDaysAgo; d++) simulateSiteDay(site);
+      // Historical alerts would have been triaged long ago - keep only the last week open in the demo.
+      for (const a of site.eng.alerts) if (a.day < site.day - 7) a.acked = true;
     }
     return site;
   });
